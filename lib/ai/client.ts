@@ -6,7 +6,8 @@ import { aiRuns } from "@/lib/db/schema";
 import { eq, desc } from "drizzle-orm";
 
 const apiKey = process.env.GEMINI_API_KEY?.trim() || "";
-export const geminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+export let activeGeminiModel = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+export const geminiModel = activeGeminiModel;
 
 export const ai = apiKey && apiKey.length > 5 ? new GoogleGenAI({ apiKey }) : null;
 
@@ -63,57 +64,106 @@ function cleanJsonOutput(raw: string): string {
 }
 
 /**
- * Execute Gemini call with 20s timeout and 1 retry
+ * Execute Gemini call with 20s timeout, automatic model fallback, and retry
  */
 async function callGeminiWithTimeoutAndRetry(
   prompt: string,
   systemPrompt?: string,
   multimodalPart?: { inlineData: { data: string; mimeType: string } }
-): Promise<string> {
+): Promise<{ text: string; modelUsed: string }> {
   if (!ai) throw new Error("Gemini AI client not initialized (missing GEMINI_API_KEY)");
 
-  const callOnce = async (attempt: number): Promise<string> => {
-    let timer: NodeJS.Timeout | null = null;
+  // Prioritize active model, then candidate fallback models
+  const candidateModels: string[] = Array.from(
+    new Set([
+      activeGeminiModel,
+      "gemini-3.8-flash",
+      "gemini-2.0-flash",
+      "gemini-1.5-flash",
+    ])
+  );
+
+  let lastError: any = null;
+
+  for (let m = 0; m < candidateModels.length; m++) {
+    const currentModel = candidateModels[m];
+
+    const callOnce = async (attempt: number): Promise<string> => {
+      let timer: NodeJS.Timeout | null = null;
+      try {
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`Gemini request timed out after 20,000ms on model ${currentModel}`));
+          }, 20000);
+        });
+
+        const contents: any[] = [];
+        if (multimodalPart) {
+          contents.push(multimodalPart);
+        }
+        contents.push(prompt);
+
+        const requestPromise = ai.models.generateContent({
+          model: currentModel,
+          contents,
+          config: {
+            systemInstruction: systemPrompt,
+            responseMimeType: "application/json",
+            temperature: 0.1,
+          },
+        });
+
+        const res = await Promise.race([requestPromise, timeoutPromise]);
+        if (timer) clearTimeout(timer);
+        const text = res.text || "";
+        if (!text) throw new Error(`Empty response returned by Gemini model ${currentModel}`);
+        return text;
+      } catch (err: any) {
+        if (timer) clearTimeout(timer);
+
+        // Check if error suggests a specific model (e.g. "Please update your code to use models/gemini-3.8-flash")
+        const suggestedModelMatch = err?.message?.match(/use (models\/)?([a-zA-Z0-9_.-]+)/i);
+        if (suggestedModelMatch && suggestedModelMatch[2]) {
+          const suggestedModel = suggestedModelMatch[2];
+          if (!candidateModels.includes(suggestedModel)) {
+            candidateModels.splice(m + 1, 0, suggestedModel);
+          }
+        }
+
+        const isModelNotFoundError =
+          err?.status === 404 ||
+          err?.status === "NOT_FOUND" ||
+          err?.message?.includes("404") ||
+          err?.message?.includes("no longer available") ||
+          err?.message?.includes("not found") ||
+          err?.message?.includes("is not supported");
+
+        if (isModelNotFoundError && m < candidateModels.length - 1) {
+          console.warn(`[AI Engine] Model '${currentModel}' unavailable: ${err?.message}. Auto-switching to next candidate...`);
+          throw err;
+        }
+
+        if (attempt === 1 && !isModelNotFoundError) {
+          // Retry once after brief 500ms delay on transient network error
+          await new Promise((r) => setTimeout(r, 500));
+          return callOnce(2);
+        }
+        throw err;
+      }
+    };
+
     try {
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          reject(new Error("Gemini request timed out after 20,000ms"));
-        }, 20000);
-      });
-
-      const contents: any[] = [];
-      if (multimodalPart) {
-        contents.push(multimodalPart);
-      }
-      contents.push(prompt);
-
-      const requestPromise = ai.models.generateContent({
-        model: geminiModel,
-        contents,
-        config: {
-          systemInstruction: systemPrompt,
-          responseMimeType: "application/json",
-          temperature: 0.1,
-        },
-      });
-
-      const res = await Promise.race([requestPromise, timeoutPromise]);
-      if (timer) clearTimeout(timer);
-      const text = res.text || "";
-      if (!text) throw new Error("Empty response returned by Gemini model");
-      return text;
+      const text = await callOnce(1);
+      // Success! Update active model for subsequent calls
+      activeGeminiModel = currentModel;
+      return { text, modelUsed: currentModel };
     } catch (err: any) {
-      if (timer) clearTimeout(timer);
-      if (attempt === 1) {
-        // Retry once after brief 500ms delay
-        await new Promise((r) => setTimeout(r, 500));
-        return callOnce(2);
-      }
-      throw err;
+      lastError = err;
+      continue;
     }
-  };
+  }
 
-  return callOnce(1);
+  throw lastError || new Error("All candidate Gemini models failed.");
 }
 
 /**
@@ -178,11 +228,13 @@ export async function executeStructuredAI<T>(
 
   // 2. Call Gemini with timeout and retry
   try {
-    let rawText = await callGeminiWithTimeoutAndRetry(
+    let geminiRes = await callGeminiWithTimeoutAndRetry(
       params.prompt,
       params.systemPrompt,
       params.multimodalPart
     );
+    let rawText = geminiRes.text;
+    let modelUsed = geminiRes.modelUsed;
 
     let parsedJson: any;
     try {
@@ -190,11 +242,13 @@ export async function executeStructuredAI<T>(
     } catch (parseErr) {
       // Retry once on invalid JSON
       const correctionPrompt = `${params.prompt}\n\nIMPORTANT: Your previous output was not valid JSON. You MUST return ONLY valid JSON matching this schema:\n${parseErr}`;
-      rawText = await callGeminiWithTimeoutAndRetry(
+      geminiRes = await callGeminiWithTimeoutAndRetry(
         correctionPrompt,
         params.systemPrompt,
         params.multimodalPart
       );
+      rawText = geminiRes.text;
+      modelUsed = geminiRes.modelUsed;
       parsedJson = JSON.parse(cleanJsonOutput(rawText));
     }
 
@@ -211,7 +265,7 @@ export async function executeStructuredAI<T>(
           userId: actingUserId,
           inputHash,
           output: outputJson,
-          model: geminiModel,
+          model: modelUsed,
           latencyMs,
           status: "success",
           accepted: null,
@@ -228,7 +282,7 @@ export async function executeStructuredAI<T>(
       isFallback: false,
       runId,
       latencyMs,
-      model: geminiModel,
+      model: modelUsed,
       inputsSummary: params.inputsForHashAndSummary,
       asOf,
       rawOutput: outputJson,
