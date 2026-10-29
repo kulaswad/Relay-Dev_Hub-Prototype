@@ -6,7 +6,7 @@ import { aiRuns } from "@/lib/db/schema";
 import { eq, desc } from "drizzle-orm";
 
 const apiKey = process.env.GEMINI_API_KEY?.trim() || "";
-export let activeGeminiModel = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+export let activeGeminiModel = process.env.GEMINI_MODEL || "gemini-flash-latest";
 export const geminiModel = activeGeminiModel;
 
 export const ai = apiKey && apiKey.length > 5 ? new GoogleGenAI({ apiKey }) : null;
@@ -73,13 +73,14 @@ async function callGeminiWithTimeoutAndRetry(
 ): Promise<{ text: string; modelUsed: string }> {
   if (!ai) throw new Error("Gemini AI client not initialized (missing GEMINI_API_KEY)");
 
-  // Prioritize active model, then candidate fallback models
+  // Prioritize active model, then official @google/genai candidate models
   const candidateModels: string[] = Array.from(
     new Set([
       activeGeminiModel,
+      "gemini-flash-latest",
+      "gemini-flash-lite-latest",
       "gemini-3.8-flash",
-      "gemini-2.0-flash",
-      "gemini-1.5-flash",
+      "gemini-pro-latest",
     ])
   );
 
