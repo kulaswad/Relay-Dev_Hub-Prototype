@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import path from "path";
-import { createHash } from "crypto";
+import crypto from "crypto";
+import bcrypt from "bcryptjs";
 
 const dbPath = process.env.DATABASE_URL
   ? path.resolve(process.cwd(), process.env.DATABASE_URL)
@@ -9,13 +10,39 @@ const dbPath = process.env.DATABASE_URL
 const sqlite = new Database(dbPath);
 sqlite.pragma("foreign_keys = OFF");
 
-console.log("🌱 Starting Relay BMP database migration & rich seed...");
+console.log("🌱 Starting Relay Developer Hub database migration & seed...");
 console.log("📍 Target SQLite database:", dbPath);
 
 // ---------------------------------------------------------------------------
 // 1. Drop existing tables
 // ---------------------------------------------------------------------------
 const tablesToDrop = [
+  "known_issues",
+  "incidents",
+  "ai_runs",
+  "limit_requests",
+  "usage_alert_preferences",
+  "solutions_inquiries",
+  "doc_feedback",
+  "changelog_subscriptions",
+  "doc_chunks",
+  "support_threads",
+  "api_versions",
+  "changelog_entries",
+  "events_ingested",
+  "events_log",
+  "customers_profiles",
+  "customer_profiles",
+  "messages",
+  "api_requests",
+  "webhook_deliveries",
+  "webhook_events",
+  "webhook_endpoints",
+  "api_key_audit_logs",
+  "api_keys",
+  "sessions",
+  "users",
+  // Legacy / internal BMP tables
   "approval_policies",
   "tasks",
   "alerts",
@@ -38,13 +65,6 @@ const tablesToDrop = [
   "organizations",
   "plans",
   "internal_users",
-  // Old legacy table names
-  "audit_logs",
-  "approvals",
-  "billing_invoices",
-  "credit_transactions",
-  "message_templates",
-  "kyc_records",
 ];
 
 for (const t of tablesToDrop) {
@@ -52,9 +72,22 @@ for (const t of tablesToDrop) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Create Schema with Indexes
+// 2. Create Schema for Developer Hub & Core Operations
 // ---------------------------------------------------------------------------
 sqlite.exec(`
+  -- Users
+  CREATE TABLE users (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    company TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'Backend dev',
+    intent TEXT NOT NULL DEFAULT 'Evaluating Relay',
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  );
+
+  -- Internal Users (for employee/admin references)
   CREATE TABLE internal_users (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -64,6 +97,7 @@ sqlite.exec(`
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
   );
 
+  -- Pricing Plans
   CREATE TABLE plans (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -77,273 +111,309 @@ sqlite.exec(`
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
   );
 
+  -- Organizations
   CREATE TABLE organizations (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    legal_name TEXT NOT NULL,
+    legal_name TEXT NOT NULL DEFAULT '',
     slug TEXT NOT NULL UNIQUE,
-    industry TEXT NOT NULL,
-    city TEXT NOT NULL,
-    owner_am_id TEXT NOT NULL REFERENCES internal_users(id),
+    industry TEXT NOT NULL DEFAULT 'Fintech',
+    city TEXT NOT NULL DEFAULT 'Bengaluru',
+    owner_am_id TEXT NOT NULL DEFAULT 'usr_priya_sharma',
     status TEXT NOT NULL DEFAULT 'active',
     billing_model TEXT NOT NULL DEFAULT 'prepaid',
-    plan_id TEXT NOT NULL REFERENCES plans(id),
+    plan_id TEXT NOT NULL DEFAULT 'plan_starter',
     contract_start INTEGER,
     contract_end INTEGER,
     tags TEXT,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
   );
-  CREATE INDEX org_status_idx ON organizations(status);
-  CREATE INDEX org_owner_am_idx ON organizations(owner_am_id);
-  CREATE INDEX org_billing_model_idx ON organizations(billing_model);
 
+  -- Workspaces
   CREATE TABLE workspaces (
     id TEXT PRIMARY KEY,
     org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    organization_id TEXT,
     name TEXT NOT NULL,
     slug TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
-    gstin TEXT NOT NULL,
-    billing_state TEXT NOT NULL,
+    kyc_status TEXT NOT NULL DEFAULT 'not_started',
+    sender_ids TEXT NOT NULL DEFAULT '[]',
+    plan_tier TEXT NOT NULL DEFAULT 'sandbox',
+    rate_limit_per_min INTEGER NOT NULL DEFAULT 60,
+    monthly_quota INTEGER NOT NULL DEFAULT 10000,
     wallet_balance REAL NOT NULL DEFAULT 0,
+    is_anonymous INTEGER NOT NULL DEFAULT 0,
+    expires_at INTEGER,
+    gstin TEXT NOT NULL DEFAULT '29ABCDE1234F1Z5',
+    billing_state TEXT NOT NULL DEFAULT 'Karnataka',
     credit_limit REAL NOT NULL DEFAULT 0,
     credit_used REAL NOT NULL DEFAULT 0,
+    receiver_behavior TEXT NOT NULL DEFAULT '200',
+    acceleration_factor INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
   );
-  CREATE INDEX ws_org_id_idx ON workspaces(org_id);
-  CREATE INDEX ws_status_idx ON workspaces(status);
 
-  CREATE TABLE workspace_users (
+  -- Sessions
+  CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
+    user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL,
-    tier TEXT NOT NULL DEFAULT 'user',
-    custom_role_name TEXT,
-    last_login_at INTEGER,
-    seat_active INTEGER NOT NULL DEFAULT 1,
-    is_seat_paid INTEGER NOT NULL DEFAULT 1,
+    is_anonymous INTEGER NOT NULL DEFAULT 0,
+    expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
   );
-  CREATE INDEX wu_workspace_id_idx ON workspace_users(workspace_id);
 
-  CREATE TABLE subscriptions (
-    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
-    plan_id TEXT NOT NULL REFERENCES plans(id),
-    custom_price_overrides TEXT,
-    discount_pct REAL NOT NULL DEFAULT 0,
-    discount_reason TEXT,
-    discount_end_date INTEGER,
-    effective_from INTEGER NOT NULL
-  );
-
-  CREATE TABLE addon_catalog (
+  -- API Keys
+  CREATE TABLE api_keys (
     id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
-    type TEXT NOT NULL,
-    price REAL NOT NULL
-  );
-
-  CREATE TABLE workspace_addons (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    addon_id TEXT NOT NULL REFERENCES addon_catalog(id),
-    quantity INTEGER NOT NULL DEFAULT 1,
+    prefix TEXT NOT NULL,
+    hashed_secret TEXT NOT NULL,
+    secret_masked TEXT NOT NULL,
+    full_key_for_dev TEXT NOT NULL,
+    environment TEXT NOT NULL DEFAULT 'test',
+    scopes TEXT NOT NULL DEFAULT '["messages:send","events:write","profiles:read"]',
     status TEXT NOT NULL DEFAULT 'active',
-    start_date INTEGER NOT NULL,
-    end_date INTEGER
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    last_used_at INTEGER,
+    expires_at INTEGER,
+    rotated_from_id TEXT,
+    grace_period_ends_at INTEGER,
+    ip_allowlist TEXT,
+    created_by TEXT
   );
-  CREATE INDEX ws_addons_ws_idx ON workspace_addons(workspace_id);
 
-  CREATE TABLE usage_daily (
+  -- API Key Audit Logs
+  CREATE TABLE api_key_audit_logs (
+    id TEXT PRIMARY KEY,
+    key_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT 'developer',
+    details TEXT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  );
+
+  -- Webhook Endpoints
+  CREATE TABLE webhook_endpoints (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    date TEXT NOT NULL,
-    sms_count INTEGER NOT NULL DEFAULT 0,
-    rcs_count INTEGER NOT NULL DEFAULT 0,
-    whatsapp_count INTEGER NOT NULL DEFAULT 0,
-    delivered_pct REAL NOT NULL DEFAULT 98.5,
+    url TEXT NOT NULL,
+    environment TEXT NOT NULL DEFAULT 'test',
+    events TEXT NOT NULL DEFAULT '["message.delivered","message.failed"]',
+    signing_secret TEXT NOT NULL,
+    previous_signing_secret TEXT,
+    secret_rotation_ends_at INTEGER,
+    status TEXT NOT NULL DEFAULT 'active',
+    api_version TEXT NOT NULL DEFAULT 'v2025-10-01',
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    consecutive_failures INTEGER NOT NULL DEFAULT 0
+  );
+
+  -- Webhook Events
+  CREATE TABLE webhook_events (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    endpoint_id TEXT NOT NULL REFERENCES webhook_endpoints(id) ON DELETE CASCADE,
+    type TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    api_version TEXT NOT NULL DEFAULT 'v2025-10-01'
+  );
+
+  -- Webhook Deliveries
+  CREATE TABLE webhook_deliveries (
+    id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES webhook_events(id) ON DELETE CASCADE,
+    endpoint_id TEXT NOT NULL REFERENCES webhook_endpoints(id) ON DELETE CASCADE,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL DEFAULT 1,
+    request_headers TEXT NOT NULL DEFAULT '{}',
+    request_body TEXT NOT NULL,
+    response_status INTEGER,
+    response_headers TEXT,
+    response_body TEXT,
+    duration_ms INTEGER NOT NULL DEFAULT 100,
+    error_type TEXT NOT NULL DEFAULT 'none',
+    status TEXT NOT NULL DEFAULT 'success',
+    scheduled_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    attempted_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    next_retry_at INTEGER,
+    replay_of_id TEXT
+  );
+
+  -- API Requests
+  CREATE TABLE api_requests (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    key_id TEXT,
+    environment TEXT NOT NULL DEFAULT 'test',
+    method TEXT NOT NULL,
+    path TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL DEFAULT 45,
+    request_headers TEXT,
+    request_body TEXT,
+    response_body TEXT,
+    idempotency_key TEXT,
+    error_code TEXT,
+    request_id TEXT NOT NULL,
+    billed_amount_would_be REAL NOT NULL DEFAULT 0,
+    billed_amount_actual REAL NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    api_version TEXT NOT NULL DEFAULT 'v2025-10-01',
+    ip TEXT NOT NULL DEFAULT '127.0.0.1'
+  );
+
+  -- Messages
+  CREATE TABLE messages (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    environment TEXT NOT NULL DEFAULT 'test',
+    channel TEXT NOT NULL,
+    "to" TEXT NOT NULL,
+    recipient TEXT,
+    sender_id TEXT NOT NULL DEFAULT 'RELAYI',
+    template_id TEXT,
+    body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'delivered',
+    failure_reason TEXT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    delivered_at INTEGER,
+    external_ref TEXT,
+    cost_would_be REAL NOT NULL DEFAULT 0,
     cost REAL NOT NULL DEFAULT 0
   );
-  CREATE UNIQUE INDEX ud_ws_date_unique_idx ON usage_daily(workspace_id, date);
-  CREATE INDEX ud_date_idx ON usage_daily(date);
 
-  CREATE TABLE wallet_transactions (
+  -- Customer Profiles (CDP)
+  CREATE TABLE customers_profiles (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    type TEXT NOT NULL,
-    amount REAL NOT NULL,
-    balance_after REAL NOT NULL,
-    reference TEXT,
-    created_by TEXT NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-  );
-  CREATE INDEX wt_workspace_id_idx ON wallet_transactions(workspace_id);
-
-  CREATE TABLE invoices (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    period TEXT NOT NULL,
-    amount REAL NOT NULL,
-    gst_amount REAL NOT NULL,
-    status TEXT NOT NULL DEFAULT 'issued',
-    issued_at INTEGER NOT NULL,
-    due_at INTEGER NOT NULL,
-    paid_at INTEGER,
-    line_items TEXT NOT NULL
-  );
-  CREATE INDEX inv_workspace_id_idx ON invoices(workspace_id);
-  CREATE INDEX inv_status_idx ON invoices(status);
-
-  CREATE TABLE credit_history (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    old_limit REAL NOT NULL,
-    new_limit REAL NOT NULL,
-    reason TEXT NOT NULL,
-    changed_by TEXT NOT NULL,
-    approved_by TEXT,
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-  );
-  CREATE INDEX ch_workspace_id_idx ON credit_history(workspace_id);
-
-  CREATE TABLE tickets (
-    id TEXT PRIMARY KEY,
-    org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-    subject TEXT NOT NULL,
-    priority TEXT NOT NULL DEFAULT 'medium',
-    status TEXT NOT NULL DEFAULT 'open',
-    category TEXT NOT NULL,
+    environment TEXT NOT NULL DEFAULT 'test',
+    external_id TEXT NOT NULL,
+    attributes TEXT NOT NULL DEFAULT '{}',
+    traits TEXT NOT NULL DEFAULT '{}',
+    events_count INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-    resolved_at INTEGER
-  );
-  CREATE INDEX tkt_org_id_idx ON tickets(org_id);
-  CREATE INDEX tkt_status_idx ON tickets(status);
-
-  CREATE TABLE kyc_cases (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    status TEXT NOT NULL DEFAULT 'submitted',
-    submitted_at INTEGER,
-    assigned_to TEXT REFERENCES internal_users(id),
-    documents TEXT,
-    declared_data TEXT,
-    sla_due_at INTEGER,
-    notes TEXT
-  );
-  CREATE INDEX kyc_workspace_id_idx ON kyc_cases(workspace_id);
-  CREATE INDEX kyc_status_idx ON kyc_cases(status);
-
-  CREATE TABLE sender_ids (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    header TEXT NOT NULL,
-    channel TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'submitted',
-    submitted_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-    approved_at INTEGER,
-    rejection_reason TEXT
-  );
-  CREATE INDEX sid_workspace_id_idx ON sender_ids(workspace_id);
-  CREATE INDEX sid_status_idx ON sender_ids(status);
-
-  CREATE TABLE templates (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    category TEXT NOT NULL,
-    body TEXT NOT NULL,
-    dlt_template_id TEXT,
-    status TEXT NOT NULL DEFAULT 'submitted',
-    submitted_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-  );
-  CREATE INDEX tmpl_workspace_id_idx ON templates(workspace_id);
-
-  CREATE TABLE change_requests (
-    id TEXT PRIMARY KEY,
-    type TEXT NOT NULL,
-    target_type TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    requested_by TEXT NOT NULL REFERENCES internal_users(id),
-    approver_role_needed TEXT NOT NULL,
-    approved_by TEXT REFERENCES internal_users(id),
-    reason TEXT NOT NULL,
-    decision_note TEXT,
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-    decided_at INTEGER,
-    expires_at INTEGER
-  );
-  CREATE INDEX cr_status_idx ON change_requests(status);
-  CREATE INDEX cr_target_idx ON change_requests(target_type, target_id);
-
-  CREATE TABLE audit_log (
-    id TEXT PRIMARY KEY,
-    timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-    actor_id TEXT NOT NULL,
-    actor_role TEXT NOT NULL,
-    action TEXT NOT NULL,
-    target_type TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    org_id TEXT,
-    before TEXT,
-    after TEXT,
-    reason TEXT NOT NULL,
-    change_request_id TEXT REFERENCES change_requests(id),
-    ai_assisted INTEGER NOT NULL DEFAULT 0,
-    ip TEXT NOT NULL DEFAULT '10.14.0.24',
-    prev_hash TEXT,
-    hash TEXT,
-    is_denied INTEGER NOT NULL DEFAULT 0
-  );
-  CREATE INDEX al_timestamp_idx ON audit_log(timestamp);
-  CREATE INDEX al_target_idx ON audit_log(target_type, target_id);
-  CREATE INDEX al_org_id_idx ON audit_log(org_id);
-
-  CREATE TABLE ai_runs (
-    id TEXT PRIMARY KEY,
-    feature TEXT NOT NULL,
-    user_id TEXT NOT NULL REFERENCES internal_users(id),
-    input_hash TEXT NOT NULL,
-    output TEXT NOT NULL,
-    model TEXT NOT NULL,
-    latency_ms INTEGER NOT NULL,
-    status TEXT NOT NULL,
-    accepted INTEGER,
-    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-  );
-  CREATE INDEX air_feature_idx ON ai_runs(feature);
-  CREATE INDEX air_user_idx ON ai_runs(user_id);
-
-  CREATE TABLE tasks (
-    id TEXT PRIMARY KEY,
-    org_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-    assigned_to TEXT NOT NULL REFERENCES internal_users(id),
-    title TEXT NOT NULL,
-    source TEXT NOT NULL DEFAULT 'manual',
-    status TEXT NOT NULL DEFAULT 'pending',
-    due_at INTEGER
-  );
-  CREATE INDEX tsk_org_id_idx ON tasks(org_id);
-  CREATE INDEX tsk_assigned_to_idx ON tasks(assigned_to);
-  CREATE INDEX tsk_status_idx ON tasks(status);
-
-  CREATE TABLE approval_policies (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL,
-    action_type TEXT NOT NULL,
-    threshold_type TEXT NOT NULL,
-    threshold_value REAL,
-    approver_role TEXT NOT NULL,
-    is_active INTEGER NOT NULL DEFAULT 1,
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
   );
 
-  CREATE TABLE IF NOT EXISTS alerts (
+  -- Events Ingested
+  CREATE TABLE events_ingested (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    environment TEXT NOT NULL DEFAULT 'test',
+    customer_id TEXT REFERENCES customers_profiles(id) ON DELETE SET NULL,
+    event_name TEXT NOT NULL,
+    properties TEXT NOT NULL DEFAULT '{}',
+    timestamp INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  );
+
+  -- Changelog Entries
+  CREATE TABLE changelog_entries (
+    id TEXT PRIMARY KEY,
+    version TEXT NOT NULL,
+    date TEXT NOT NULL,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    affected_endpoints TEXT NOT NULL DEFAULT '[]',
+    breaking INTEGER NOT NULL DEFAULT 0,
+    sunset_date TEXT
+  );
+
+  -- API Versions
+  CREATE TABLE api_versions (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'supported',
+    released_at TEXT NOT NULL,
+    sunset_at TEXT
+  );
+
+  -- Support Threads
+  CREATE TABLE support_threads (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    subject TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    context TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    messages TEXT NOT NULL DEFAULT '[]'
+  );
+
+  -- Doc Chunks
+  CREATE TABLE doc_chunks (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL,
+    title TEXT NOT NULL,
+    section TEXT NOT NULL,
+    content TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT 'v2025-10-01'
+  );
+
+  -- Doc Feedback
+  CREATE TABLE doc_feedback (
+    id TEXT PRIMARY KEY,
+    page_path TEXT NOT NULL,
+    helpful INTEGER NOT NULL,
+    comment TEXT,
+    version TEXT NOT NULL DEFAULT 'v2025-10-01',
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  );
+
+  -- Changelog Subscriptions
+  CREATE TABLE changelog_subscriptions (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    subscribed_breaking_changes INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  );
+
+  -- Solutions Inquiries
+  CREATE TABLE solutions_inquiries (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    company TEXT NOT NULL,
+    monthly_volume TEXT NOT NULL,
+    channels TEXT,
+    use_case TEXT,
+    status TEXT NOT NULL DEFAULT 'new',
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  );
+
+  -- Usage Alert Preferences
+  CREATE TABLE usage_alert_preferences (
+    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+    threshold_80 INTEGER NOT NULL DEFAULT 1,
+    threshold_95 INTEGER NOT NULL DEFAULT 1,
+    spike_429 INTEGER NOT NULL DEFAULT 1,
+    low_balance_threshold REAL NOT NULL DEFAULT 500,
+    email_notifications INTEGER NOT NULL DEFAULT 1,
+    notification_email TEXT,
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  );
+
+  -- Limit Requests
+  CREATE TABLE limit_requests (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    current_tier TEXT NOT NULL,
+    requested_tps INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    channels TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  );
+
+  -- Alerts & Notifications
+  CREATE TABLE alerts (
     id TEXT PRIMARY KEY,
     workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
     org_id TEXT REFERENCES organizations(id) ON DELETE CASCADE,
@@ -354,2100 +424,748 @@ sqlite.exec(`
     is_read INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
   );
-  CREATE INDEX IF NOT EXISTS alerts_ws_idx ON alerts(workspace_id);
-  CREATE INDEX IF NOT EXISTS alerts_type_idx ON alerts(type);
-  CREATE INDEX IF NOT EXISTS alerts_created_idx ON alerts(created_at);
+
+  -- AI Runs Telemetry
+  CREATE TABLE ai_runs (
+    id TEXT PRIMARY KEY,
+    feature TEXT NOT NULL,
+    user_id TEXT,
+    workspace_id TEXT,
+    input_hash TEXT NOT NULL,
+    output TEXT NOT NULL,
+    model TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    accepted INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  );
+
+  -- System Incidents
+  CREATE TABLE incidents (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'resolved',
+    impact TEXT NOT NULL DEFAULT 'none',
+    affected_components TEXT NOT NULL DEFAULT '[]',
+    updates TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    resolved_at INTEGER
+  );
+
+  -- Known Issues
+  CREATE TABLE known_issues (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    component TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'workaround_available',
+    description TEXT NOT NULL,
+    workaround TEXT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  );
+
+  -- Indexes for high-throughput lookups
+  CREATE INDEX idx_users_email ON users(email);
+  CREATE INDEX idx_sessions_user ON sessions(user_id);
+  CREATE INDEX idx_sessions_ws ON sessions(workspace_id);
+  CREATE INDEX idx_workspaces_org ON workspaces(org_id);
+  CREATE INDEX idx_api_keys_ws ON api_keys(workspace_id);
+  CREATE INDEX idx_wh_endpoints_ws ON webhook_endpoints(workspace_id);
+  CREATE INDEX idx_wh_deliveries_ws ON webhook_deliveries(workspace_id);
+  CREATE INDEX idx_api_requests_ws ON api_requests(workspace_id);
+  CREATE INDEX idx_api_requests_created ON api_requests(created_at);
+  CREATE INDEX idx_messages_ws ON messages(workspace_id);
+  CREATE INDEX idx_profiles_ws ON customers_profiles(workspace_id);
+  CREATE INDEX idx_events_ws ON events_ingested(workspace_id);
 `);
 
-sqlite.pragma("foreign_keys = ON");
+console.log("✅ Schema created with all developer hub tables and indexes.");
 
 // ---------------------------------------------------------------------------
-// 3. Seeded Deterministic PRNG (Mulberry32)
+// 3. Seed Base Catalogs (Internal users, Plans, API Versions)
 // ---------------------------------------------------------------------------
-function createRNG(seed = 133742) {
-  let s = seed >>> 0;
-  return function () {
-    s = (s + 0x6d2b79f5) >>> 0;
-    let t = Math.imul(s ^ (s >>> 15), 1 | s);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+sqlite.exec(`
+  INSERT INTO internal_users (id, name, email, role, avatar_color) VALUES
+  ('usr_priya_sharma', 'Priya Sharma', 'priya.sharma@relay.internal', 'account_manager', '#7C7CFF'),
+  ('usr_rohit_verma', 'Rohit Verma', 'rohit.verma@relay.internal', 'compliance', '#3FB68B'),
+  ('usr_arjun_nair', 'Arjun Nair', 'arjun.nair@relay.internal', 'support', '#5B9DFF');
 
-const rng = createRNG(421337);
-function randomChoice<T>(arr: T[]): T {
-  return arr[Math.floor(rng() * arr.length)];
-}
-function randomInt(min: number, max: number): number {
-  return Math.floor(rng() * (max - min + 1)) + min;
-}
-function randomFloat(min: number, max: number, decimals = 2): number {
-  const val = rng() * (max - min) + min;
-  return Number(val.toFixed(decimals));
-}
+  INSERT INTO plans (id, name, billing_model, base_fee_monthly, included_seats, per_message_rates, throughput_mps, features) VALUES
+  ('plan_starter', 'Starter Developer', 'both', 0, 3, '{"sms":0.12,"rcs":0.20,"whatsapp":0.35}', 50, '["sandbox_access","community_support","webhook_logs"]'),
+  ('plan_growth', 'Growth', 'both', 4999, 10, '{"sms":0.11,"rcs":0.18,"whatsapp":0.32}', 250, '["sla_99_9","priority_support","cdp_ingestion"]'),
+  ('plan_enterprise', 'Enterprise Scale', 'postpaid', 24999, 50, '{"sms":0.10,"rcs":0.15,"whatsapp":0.30}', 5000, '["dedicated_am","custom_smpp_tps","unlimited_retries"]');
+
+  INSERT INTO api_versions (id, label, status, released_at, sunset_at) VALUES
+  ('v2025-10-01', 'v2025-10-01 (Current GA)', 'current', '2026-10-01', NULL),
+  ('v2025-01-15', 'v2025-01-15 (Supported)', 'supported', '2025-01-15', NULL),
+  ('v2024-06-01', 'v2024-06-01 (Deprecated)', 'deprecated', '2024-06-01', '2027-06-01');
+`);
 
 // ---------------------------------------------------------------------------
-// 4. Seed Internal Users (at least 2 per role)
+// 4. Seed Demo Account (AcmePay Technologies)
 // ---------------------------------------------------------------------------
-const internalUsersList = [
-  // Account Managers
-  { id: "usr_am_priya", name: "Priya Sharma", email: "priya.sharma@relay.in", role: "account_manager", avatarColor: "#7C7CFF" },
-  { id: "usr_am_rohan", name: "Rohan Verma", email: "rohan.verma@relay.in", role: "account_manager", avatarColor: "#5B9DFF" },
-  { id: "usr_am_ananya", name: "Ananya Iyer", email: "ananya.iyer@relay.in", role: "account_manager", avatarColor: "#3FB68B" },
-  // Finance
-  { id: "usr_fin_vikram", name: "Vikram Mehta", email: "vikram.mehta@relay.in", role: "finance", avatarColor: "#E0A93B" },
-  { id: "usr_fin_sneha", name: "Sneha Kulkarni", email: "sneha.kulkarni@relay.in", role: "finance", avatarColor: "#E5534B" },
-  // Finance Head
-  { id: "usr_fin_rajesh", name: "Rajesh Nair", email: "rajesh.nair@relay.in", role: "finance_head", avatarColor: "#D97706" },
-  { id: "usr_fin_sunita", name: "Sunita Rao", email: "sunita.rao@relay.in", role: "finance_head", avatarColor: "#B45309" },
-  // Compliance
-  { id: "usr_comp_kavita", name: "Kavita Nair", email: "kavita.nair@relay.in", role: "compliance", avatarColor: "#10B981" },
-  { id: "usr_comp_suresh", name: "Suresh Menon", email: "suresh.menon@relay.in", role: "compliance", avatarColor: "#059669" },
-  // Sales Ops
-  { id: "usr_ops_amit", name: "Amit Bansal", email: "amit.bansal@relay.in", role: "sales_ops", avatarColor: "#8B5CF6" },
-  { id: "usr_ops_divya", name: "Divya Nair", email: "divya.nair@relay.in", role: "sales_ops", avatarColor: "#6366F1" },
-  // Customer Support
-  { id: "usr_sup_rahul", name: "Rahul Sen", email: "rahul.sen@relay.in", role: "support", avatarColor: "#EC4899" },
-  { id: "usr_sup_pooja", name: "Pooja Patel", email: "pooja.patel@relay.in", role: "support", avatarColor: "#F43F5E" },
-  // Admin
-  { id: "usr_adm_kabir", name: "Kabir Anand", email: "kabir.anand@relay.in", role: "admin", avatarColor: "#7C7CFF" },
-  { id: "usr_adm_meera", name: "Meera Joshi", email: "meera.joshi@relay.in", role: "admin", avatarColor: "#9333EA" },
-];
+const demoPasswordHash = bcrypt.hashSync("demo1234", 10);
+const nowEpoch = Math.floor(Date.now() / 1000);
 
 const insertUser = sqlite.prepare(`
-  INSERT INTO internal_users (id, name, email, role, avatar_color)
-  VALUES (?, ?, ?, ?, ?)
-`);
-for (const u of internalUsersList) {
-  insertUser.run(u.id, u.name, u.email, u.role, u.avatarColor);
-}
-
-// ---------------------------------------------------------------------------
-// 5. Seed Pricing Plans
-// ---------------------------------------------------------------------------
-const plansList = [
-  {
-    id: "plan_starter",
-    name: "Starter",
-    billingModel: "prepaid",
-    baseFeeMonthly: 5000,
-    includedSeats: 3,
-    perMessageRates: JSON.stringify({ sms: 0.18, rcs: 0.28, whatsapp: 0.45 }),
-    throughputMps: 30,
-    features: JSON.stringify(["Prepaid only", "Single Workspace", "Standard SMS & WhatsApp API", "Community Support"]),
-    priceFloors: JSON.stringify({ sms: 0.15, rcs: 0.24, whatsapp: 0.38 }),
-  },
-  {
-    id: "plan_growth",
-    name: "Growth",
-    billingModel: "both",
-    baseFeeMonthly: 25000,
-    includedSeats: 8,
-    perMessageRates: JSON.stringify({ sms: 0.14, rcs: 0.22, whatsapp: 0.38 }),
-    throughputMps: 100,
-    features: JSON.stringify(["Prepaid or Postpaid", "Up to 5 Workspaces", "DLT Header Support", "Webhooks & Retry Logs"]),
-    priceFloors: JSON.stringify({ sms: 0.11, rcs: 0.18, whatsapp: 0.30 }),
-  },
-  {
-    id: "plan_scale",
-    name: "Scale",
-    billingModel: "postpaid",
-    baseFeeMonthly: 75000,
-    includedSeats: 20,
-    perMessageRates: JSON.stringify({ sms: 0.11, rcs: 0.18, whatsapp: 0.32 }),
-    throughputMps: 350,
-    features: JSON.stringify(["Postpaid with Credit Line", "Unlimited Workspaces", "Dedicated AM", "Priority DLT Verification"]),
-    priceFloors: JSON.stringify({ sms: 0.08, rcs: 0.14, whatsapp: 0.25 }),
-  },
-  {
-    id: "plan_enterprise",
-    name: "Enterprise",
-    billingModel: "postpaid",
-    baseFeeMonthly: 150000,
-    includedSeats: 50,
-    perMessageRates: JSON.stringify({ sms: 0.09, rcs: 0.15, whatsapp: 0.28 }),
-    throughputMps: 1000,
-    features: JSON.stringify(["Custom SLA 99.99%", "Custom Rate Cards", "Bespoke DLT routing", "24/7 Phone & Slack Support"]),
-    priceFloors: JSON.stringify({ sms: 0.06, rcs: 0.10, whatsapp: 0.20 }),
-  },
-];
-
-const insertPlan = sqlite.prepare(`
-  INSERT INTO plans (id, name, billing_model, base_fee_monthly, included_seats, per_message_rates, throughput_mps, features, price_floors)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-for (const p of plansList) {
-  insertPlan.run(p.id, p.name, p.billingModel, p.baseFeeMonthly, p.includedSeats, p.perMessageRates, p.throughputMps, p.features, p.priceFloors);
-}
-
-// ---------------------------------------------------------------------------
-// 6. Seed Addon Catalog
-// ---------------------------------------------------------------------------
-const addonsList = [
-  { id: "addon_extra_tps_50", name: "Extra throughput 50 MPS", type: "recurring", price: 15000 },
-  { id: "addon_seat", name: "Additional seat", type: "recurring", price: 1200 },
-  { id: "addon_dedicated_number", name: "Dedicated sender number", type: "recurring", price: 8000 },
-  { id: "addon_priority_support", name: "Priority support", type: "recurring", price: 25000 },
-];
-
-const insertAddon = sqlite.prepare(`
-  INSERT INTO addon_catalog (id, name, type, price)
-  VALUES (?, ?, ?, ?)
-`);
-for (const a of addonsList) {
-  insertAddon.run(a.id, a.name, a.type, a.price);
-}
-
-// ---------------------------------------------------------------------------
-// 7. Generate 42 Organizations (Invented Indian Companies)
-// Mix: 24 prepaid, 18 postpaid; ~25 healthy active, 9 at-risk, 5 suspended, 3 onboarding
-// ---------------------------------------------------------------------------
-const indianCities = [
-  { city: "Mumbai", state: "Maharashtra", stateCode: "27" },
-  { city: "Bengaluru", state: "Karnataka", stateCode: "29" },
-  { city: "New Delhi", state: "Delhi", stateCode: "07" },
-  { city: "Hyderabad", state: "Telangana", stateCode: "36" },
-  { city: "Chennai", state: "Tamil Nadu", stateCode: "33" },
-  { city: "Pune", state: "Maharashtra", stateCode: "27" },
-  { city: "Gurugram", state: "Haryana", stateCode: "06" },
-  { city: "Noida", state: "Uttar Pradesh", stateCode: "09" },
-  { city: "Ahmedabad", state: "Gujarat", stateCode: "24" },
-  { city: "Jaipur", state: "Rajasthan", stateCode: "08" },
-  { city: "Kolkata", state: "West Bengal", stateCode: "19" },
-];
-
-function generateGSTIN(stateCode: string, panChars: string): string {
-  return `${stateCode}${panChars}1Z${randomChoice(["A", "B", "C", "5", "8", "9"])}`;
-}
-
-interface RawOrgConfig {
-  id: string;
-  name: string;
-  legalName: string;
-  slug: string;
-  industry: "BFSI" | "Insurance" | "D2C" | "Edtech" | "Fintech" | "Healthcare" | "Travel" | "Logistics";
-  city: string;
-  ownerAmId: string;
-  status: "onboarding" | "active" | "at_risk" | "suspended" | "offboarded";
-  billingModel: "prepaid" | "postpaid";
-  planId: string;
-  tags: string[];
-  workspacesCount: number;
-  churnProfile?: "steep_drop" | "normal" | "rising";
-  creditBurnProfile?: "dangerous_high" | "normal" | "low";
-  hasWastedSeats?: boolean;
-  hasOverdueInvoice?: boolean;
-  hasDisputedInvoice?: boolean;
-  hasZeroPrepaidBalance?: boolean;
-}
-
-// 42 defined org configurations:
-const rawOrgs: RawOrgConfig[] = [
-  // --- HERO ORG ---
-  {
-    id: "org_meridian_finserv",
-    name: "Meridian Finserv",
-    legalName: "MERIDIAN FINANCIAL SERVICES PRIVATE LIMITED",
-    slug: "meridian-finserv",
-    industry: "BFSI",
-    city: "Mumbai",
-    ownerAmId: "usr_am_rohan",
-    status: "at_risk",
-    billingModel: "postpaid",
-    planId: "plan_enterprise",
-    tags: ["hero-demo", "enterprise-tier1", "credit-warning", "churn-risk"],
-    workspacesCount: 3,
-    churnProfile: "steep_drop", // -36% drop over 30d
-    creditBurnProfile: "dangerous_high", // 88% credit used on SME workspace
-    hasWastedSeats: true, // 4 of 10 paid seats inactive for 52 days
-    hasOverdueInvoice: true, // 38 days overdue
-  },
-
-  // --- 17 OTHER POSTPAID ORGS ---
-  {
-    id: "org_payvantage",
-    name: "PayVantage Technologies",
-    legalName: "PAYVANTAGE SOLUTIONS INDIA PVT LTD",
-    slug: "payvantage",
-    industry: "Fintech",
-    city: "Bengaluru",
-    ownerAmId: "usr_am_priya",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_enterprise",
-    tags: ["fintech-pg", "high-volume"],
-    workspacesCount: 2,
-    creditBurnProfile: "dangerous_high", // 92% credit used
-    churnProfile: "normal",
-  },
-  {
-    id: "org_kubermf",
-    name: "Kuber Microfinance Ltd",
-    legalName: "KUBER GRAMIN MICROFINANCE LIMITED",
-    slug: "kuber-microfinance",
-    industry: "BFSI",
-    city: "Pune",
-    ownerAmId: "usr_am_ananya",
-    status: "at_risk",
-    billingModel: "postpaid",
-    planId: "plan_scale",
-    tags: ["rural-loans", "collections-burst"],
-    workspacesCount: 2,
-    creditBurnProfile: "dangerous_high", // 94% credit used
-    churnProfile: "steep_drop",
-  },
-  {
-    id: "org_surakshabima",
-    name: "Suraksha Bima Broking",
-    legalName: "SURAKSHA GENERAL INSURANCE BROKERS LTD",
-    slug: "suraksha-bima",
-    industry: "Insurance",
-    city: "New Delhi",
-    ownerAmId: "usr_am_priya",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_scale",
-    tags: ["insurtech", "claim-alerts"],
-    workspacesCount: 2,
-    creditBurnProfile: "dangerous_high", // 78% credit used
-  },
-  {
-    id: "org_zenithlogistics",
-    name: "Zenith Express Logistics",
-    legalName: "ZENITH LOGISTICS CLOUD INDIA PRIVATE LIMITED",
-    slug: "zenith-logistics",
-    industry: "Logistics",
-    city: "Bengaluru",
-    ownerAmId: "usr_am_rohan",
-    status: "at_risk",
-    billingModel: "postpaid",
-    planId: "plan_growth",
-    tags: ["kyc-mismatch", "tracking-sms"],
-    workspacesCount: 1,
-    creditBurnProfile: "dangerous_high", // 84% credit used
-    hasOverdueInvoice: true, // 22 days late
-  },
-  {
-    id: "org_fintrack",
-    name: "FinTrack Lending",
-    legalName: "FINTRACK CAPITAL INDIA PVT LTD",
-    slug: "fintrack-lending",
-    industry: "Fintech",
-    city: "Hyderabad",
-    ownerAmId: "usr_am_ananya",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_enterprise",
-    tags: ["instant-loans", "tier-1"],
-    workspacesCount: 2,
-    hasWastedSeats: true,
-  },
-  {
-    id: "org_bharathealth",
-    name: "BharatHealth Diagnostics",
-    legalName: "BHARAT HEALTHCARE LABS PVT LTD",
-    slug: "bharat-health",
-    industry: "Healthcare",
-    city: "Chennai",
-    ownerAmId: "usr_am_priya",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_scale",
-    tags: ["health-reports", "whatsapp-verified"],
-    workspacesCount: 2,
-    hasDisputedInvoice: true, // Disputed seat count
-  },
-  {
-    id: "org_insurenest",
-    name: "InsureNest Wealth",
-    legalName: "INSURENEST BROKING INDIA LTD",
-    slug: "insurenest",
-    industry: "Insurance",
-    city: "Gurugram",
-    ownerAmId: "usr_am_rohan",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_scale",
-    tags: ["term-life", "rcs-carousels"],
-    workspacesCount: 2,
-  },
-  {
-    id: "org_swiftcargo",
-    name: "SwiftCargo Express",
-    legalName: "SWIFT CARGO SUPPLY CHAIN SOLUTIONS LTD",
-    slug: "swift-cargo",
-    industry: "Logistics",
-    city: "Ahmedabad",
-    ownerAmId: "usr_am_ananya",
-    status: "at_risk",
-    billingModel: "postpaid",
-    planId: "plan_growth",
-    tags: ["fleet-alerts", "churn-risk"],
-    workspacesCount: 2,
-    churnProfile: "steep_drop", // >30% decline
-    hasOverdueInvoice: true, // 54 days late
-  },
-  {
-    id: "org_rupeebridge",
-    name: "RupeeBridge SME Finance",
-    legalName: "RUPEE BRIDGE CREDIT SERVICES PVT LTD",
-    slug: "rupee-bridge",
-    industry: "BFSI",
-    city: "Mumbai",
-    ownerAmId: "usr_am_priya",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_scale",
-    tags: ["invoice-discounting"],
-    workspacesCount: 2,
-  },
-  {
-    id: "org_yatrawings",
-    name: "YatraWings Global",
-    legalName: "YATRA WINGS TRAVEL NETWORK INDIA LTD",
-    slug: "yatrawings",
-    industry: "Travel",
-    city: "New Delhi",
-    ownerAmId: "usr_am_rohan",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_growth",
-    tags: ["flight-otp", "whatsapp-tickets"],
-    workspacesCount: 1,
-    hasDisputedInvoice: true, // Disputed seat count
-  },
-  {
-    id: "org_aarogya",
-    name: "Aarogya Lifecare Hospitals",
-    legalName: "AAROGYA LIFECARE CLINICS PVT LTD",
-    slug: "aarogya-lifecare",
-    industry: "Healthcare",
-    city: "Hyderabad",
-    ownerAmId: "usr_am_ananya",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_scale",
-    tags: ["opd-reminders", "enterprise"],
-    workspacesCount: 2,
-    hasWastedSeats: true,
-  },
-  {
-    id: "org_nexakart",
-    name: "NexaKart Retail",
-    legalName: "NEXAKART COMMERCE SERVICES PVT LTD",
-    slug: "nexakart",
-    industry: "D2C",
-    city: "Bengaluru",
-    ownerAmId: "usr_am_priya",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_enterprise",
-    tags: ["omnichannel", "flash-sale"],
-    workspacesCount: 2,
-  },
-  {
-    id: "org_gurukuled",
-    name: "Gurukul Edutech",
-    legalName: "GURUKUL LEARNING SYSTEMS PVT LTD",
-    slug: "gurukul-edutech",
-    industry: "Edtech",
-    city: "Noida",
-    ownerAmId: "usr_am_rohan",
-    status: "at_risk",
-    billingModel: "postpaid",
-    planId: "plan_growth",
-    tags: ["live-classes", "churn-risk"],
-    workspacesCount: 1,
-    churnProfile: "steep_drop", // >30% drop
-  },
-  {
-    id: "org_vyaparflow",
-    name: "VyaparFlow Technologies",
-    legalName: "VYAPARFLOW B2B NETWORK LTD",
-    slug: "vyaparflow",
-    industry: "Fintech",
-    city: "Jaipur",
-    ownerAmId: "usr_am_ananya",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_growth",
-    tags: ["merchant-pos"],
-    workspacesCount: 2,
-  },
-  {
-    id: "org_logiprime",
-    name: "LogiPrime Multimodal",
-    legalName: "LOGIPRIME FREIGHT CORRIDORS INDIA LTD",
-    slug: "logiprime",
-    industry: "Logistics",
-    city: "Kolkata",
-    ownerAmId: "usr_am_priya",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_scale",
-    tags: ["cold-chain", "status-updates"],
-    workspacesCount: 2,
-  },
-  {
-    id: "org_dhanaseva",
-    name: "DhanaSeva Rural Credit",
-    legalName: "DHANASEVA COOPERATIVE FINCORP LTD",
-    slug: "dhanaseva",
-    industry: "BFSI",
-    city: "Ahmedabad",
-    ownerAmId: "usr_am_rohan",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_scale",
-    tags: ["shg-loans"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_carepulse",
-    name: "CarePulse Healthtech",
-    legalName: "CAREPULSE TELEHEALTH INDIA PVT LTD",
-    slug: "carepulse",
-    industry: "Healthcare",
-    city: "Bengaluru",
-    ownerAmId: "usr_am_ananya",
-    status: "active",
-    billingModel: "postpaid",
-    planId: "plan_growth",
-    tags: ["doctor-booking"],
-    workspacesCount: 1,
-    hasWastedSeats: true,
-  },
-
-  // --- 24 PREPAID ORGS ---
-  {
-    id: "org_zippymart",
-    name: "ZippyMart Hyperlocal",
-    legalName: "ZIPPYMART RETAIL PRIVATE LIMITED",
-    slug: "zippymart",
-    industry: "D2C",
-    city: "Bengaluru",
-    ownerAmId: "usr_am_priya",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_growth",
-    tags: ["10min-delivery", "otp-high"],
-    workspacesCount: 2,
-    hasZeroPrepaidBalance: true, // Balance: ₹140
-  },
-  {
-    id: "org_urbansprout",
-    name: "UrbanSprout Organic Foods",
-    legalName: "URBAN SPROUT AGRO RETAIL PVT LTD",
-    slug: "urban-sprout",
-    industry: "D2C",
-    city: "Mumbai",
-    ownerAmId: "usr_am_rohan",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["organic-farm", "direct-to-consumer"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_vedicnaturals",
-    name: "Vedic Naturals Wellness",
-    legalName: "VEDIC NATURALS AYURVEDA PVT LTD",
-    slug: "vedic-naturals",
-    industry: "D2C",
-    city: "Jaipur",
-    ownerAmId: "usr_am_ananya",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_growth",
-    tags: ["ayurveda", "whatsapp-promos"],
-    workspacesCount: 2,
-    hasWastedSeats: true,
-  },
-  {
-    id: "org_shikshasetu",
-    name: "ShikshaSetu Learning",
-    legalName: "SHIKSHA SETU DIGITAL FOUNDATION",
-    slug: "shiksha-setu",
-    industry: "Edtech",
-    city: "Pune",
-    ownerAmId: "usr_am_priya",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["gov-exams", "mock-tests"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_yoddhaclasses",
-    name: "Yoddha Defense Academy",
-    legalName: "YODDHA CAREER ACADEMY PVT LTD",
-    slug: "yoddha-classes",
-    industry: "Edtech",
-    city: "New Delhi",
-    ownerAmId: "usr_am_rohan",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["nda-cds", "sms-broadcast"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_travelsaathi",
-    name: "TravelSaathi Tours",
-    legalName: "TRAVEL SAATHI HOLIDAYS INDIA PVT LTD",
-    slug: "travel-saathi",
-    industry: "Travel",
-    city: "Mumbai",
-    ownerAmId: "usr_am_ananya",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_growth",
-    tags: ["custom-itineraries"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_quickdrop",
-    name: "QuickDrop Courier",
-    legalName: "QUICKDROP EXPRESS SERVICES PVT LTD",
-    slug: "quickdrop",
-    industry: "Logistics",
-    city: "Chennai",
-    ownerAmId: "usr_am_priya",
-    status: "suspended", // Suspended
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["negative-wallet", "suspended"],
-    workspacesCount: 1,
-    hasZeroPrepaidBalance: true, // Balance: -₹3,450
-  },
-  {
-    id: "org_mediease",
-    name: "MediEase Pharma Online",
-    legalName: "MEDIEASE HEALTHCARE PLATFORMS LTD",
-    slug: "mediease",
-    industry: "Healthcare",
-    city: "Hyderabad",
-    ownerAmId: "usr_am_rohan",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_growth",
-    tags: ["e-pharmacy", "refill-alerts"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_pureglow",
-    name: "PureGlow Botanicals",
-    legalName: "PUREGLOW DERMA CONSUMER PVT LTD",
-    slug: "pureglow",
-    industry: "D2C",
-    city: "Bengaluru",
-    ownerAmId: "usr_am_ananya",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_growth",
-    tags: ["skincare", "meta-catalog"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_parikshaprep",
-    name: "ParikshaPrep Hub",
-    legalName: "PARIKSHA PREP TEST SERVICES PVT LTD",
-    slug: "pariksha-prep",
-    industry: "Edtech",
-    city: "Noida",
-    ownerAmId: "usr_am_priya",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["gate-cat-prep"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_cargoexpress",
-    name: "CargoExpress Hub",
-    legalName: "CARGO EXPRESS INLAND FREIGHTERS PVT LTD",
-    slug: "cargo-express",
-    industry: "Logistics",
-    city: "Kolkata",
-    ownerAmId: "usr_am_rohan",
-    status: "suspended", // Suspended
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["suspended", "zero-credit"],
-    workspacesCount: 1,
-    hasZeroPrepaidBalance: true, // Balance: -₹8,120
-  },
-  {
-    id: "org_safarholiday",
-    name: "SafarHoliday Travels",
-    legalName: "SAFAR HOLIDAY DESTINATIONS LTD",
-    slug: "safar-holiday",
-    industry: "Travel",
-    city: "Jaipur",
-    ownerAmId: "usr_am_ananya",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["rajasthan-tours"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_dentacare",
-    name: "DentaCare Aligners",
-    legalName: "DENTACARE SMILES INDIA PVT LTD",
-    slug: "dentacare",
-    industry: "Healthcare",
-    city: "Mumbai",
-    ownerAmId: "usr_am_priya",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_growth",
-    tags: ["dental-leads"],
-    workspacesCount: 1,
-    hasWastedSeats: true,
-  },
-  {
-    id: "org_kaushalsetu",
-    name: "KaushalSetu Skills",
-    legalName: "KAUSHAL SETU VOCATIONAL TRAINING LTD",
-    slug: "kaushal-setu",
-    industry: "Edtech",
-    city: "Pune",
-    ownerAmId: "usr_am_rohan",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["skill-india"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_snackpop",
-    name: "SnackPop Munchies",
-    legalName: "SNACKPOP FOOD AND BEVERAGES PVT LTD",
-    slug: "snackpop",
-    industry: "D2C",
-    city: "Ahmedabad",
-    ownerAmId: "usr_am_ananya",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["healthy-snacks"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_flyocean",
-    name: "FlyOcean Charters",
-    legalName: "FLY OCEAN AVIATION CHARTERS LTD",
-    slug: "fly-ocean",
-    industry: "Travel",
-    city: "Mumbai",
-    ownerAmId: "usr_am_priya",
-    status: "at_risk",
-    billingModel: "prepaid",
-    planId: "plan_growth",
-    tags: ["vip-charters", "churn-risk"],
-    workspacesCount: 1,
-    churnProfile: "steep_drop",
-  },
-  {
-    id: "org_freshbasket",
-    name: "FreshBasket Greens",
-    legalName: "FRESH BASKET HYDROPONIC FARMS PVT LTD",
-    slug: "fresh-basket",
-    industry: "D2C",
-    city: "Bengaluru",
-    ownerAmId: "usr_am_rohan",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["hydroponics"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_edupulse",
-    name: "EduPulse K12",
-    legalName: "EDUPULSE CURRICULUM TECH PVT LTD",
-    slug: "edupulse",
-    industry: "Edtech",
-    city: "Gurugram",
-    ownerAmId: "usr_am_ananya",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_growth",
-    tags: ["cbse-icse-math"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_healthnest",
-    name: "HealthNest ElderCare",
-    legalName: "HEALTHNEST SENIOR LIVING & CARE LTD",
-    slug: "healthnest",
-    industry: "Healthcare",
-    city: "Chennai",
-    ownerAmId: "usr_am_priya",
-    status: "active",
-    billingModel: "prepaid",
-    planId: "plan_growth",
-    tags: ["home-care-alerts"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_routehaul",
-    name: "RouteHaul Logistics",
-    legalName: "ROUTEHAUL TRUCKING FREIGHT SERVICES PVT LTD",
-    slug: "routehaul",
-    industry: "Logistics",
-    city: "New Delhi",
-    ownerAmId: "usr_am_rohan",
-    status: "suspended", // Suspended
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["suspended", "failed-recharge"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_bluewave",
-    name: "BlueWave Cruises",
-    legalName: "BLUEWAVE OFFSHORE LEISURE PVT LTD",
-    slug: "bluewave-cruises",
-    industry: "Travel",
-    city: "Kochi",
-    ownerAmId: "usr_am_ananya",
-    status: "suspended", // Suspended
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["suspended", "seasonal"],
-    workspacesCount: 1,
-  },
-  // 3 Onboarding Orgs:
-  {
-    id: "org_omniinsure",
-    name: "OmniInsure Tech",
-    legalName: "OMNIINSURE UNDERWRITERS INDIA PVT LTD",
-    slug: "omni-insure",
-    industry: "Insurance",
-    city: "Bengaluru",
-    ownerAmId: "usr_am_priya",
-    status: "onboarding", // Onboarding
-    billingModel: "postpaid",
-    planId: "plan_scale",
-    tags: ["onboarding", "kyc-in-progress"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_ayurlife",
-    name: "AyurLife Organics",
-    legalName: "AYURLIFE WELLNESS LABS PVT LTD",
-    slug: "ayurlife",
-    industry: "D2C",
-    city: "Pune",
-    ownerAmId: "usr_am_rohan",
-    status: "onboarding", // Onboarding
-    billingModel: "prepaid",
-    planId: "plan_starter",
-    tags: ["onboarding", "dlt-registration"],
-    workspacesCount: 1,
-  },
-  {
-    id: "org_skoolbox",
-    name: "SkoolBox Robotics",
-    legalName: "SKOOLBOX STEM INNOVATIONS PVT LTD",
-    slug: "skoolbox",
-    industry: "Edtech",
-    city: "Hyderabad",
-    ownerAmId: "usr_am_ananya",
-    status: "onboarding", // Onboarding
-    billingModel: "prepaid",
-    planId: "plan_growth",
-    tags: ["onboarding", "stem-kits"],
-    workspacesCount: 1,
-  },
-];
-
-console.log(`Configuring ${rawOrgs.length} Organizations...`);
-
-// Insert Organizations
-const insertOrg = sqlite.prepare(`
-  INSERT INTO organizations (
-    id, name, legal_name, slug, industry, city, owner_am_id, status, billing_model, plan_id, contract_start, contract_end, tags
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const nowSeconds = Math.floor(Date.now() / 1000);
-const oneYearAgo = nowSeconds - 365 * 86400;
-const oneYearLater = nowSeconds + 365 * 86400;
-
-for (const o of rawOrgs) {
-  insertOrg.run(
-    o.id,
-    o.name,
-    o.legalName,
-    o.slug,
-    o.industry,
-    o.city,
-    o.ownerAmId,
-    o.status,
-    o.billingModel,
-    o.planId,
-    oneYearAgo,
-    oneYearLater,
-    JSON.stringify(o.tags)
-  );
-}
-
-// ---------------------------------------------------------------------------
-// 8. Generate Workspaces (58 Workspaces across the 42 Orgs)
-// ---------------------------------------------------------------------------
-interface WorkspaceData {
-  id: string;
-  orgId: string;
-  name: string;
-  slug: string;
-  status: "kyc_pending" | "kyc_in_review" | "active" | "suspended";
-  gstin: string;
-  billingState: string;
-  walletBalance: number;
-  creditLimit: number;
-  creditUsed: number;
-  churnProfile: "steep_drop" | "normal" | "rising";
-  hasWastedSeats: boolean;
-}
-
-const workspacesList: WorkspaceData[] = [];
-let wsGlobalIdx = 1;
-
-for (const o of rawOrgs) {
-  const cityInfo = indianCities.find((c) => c.city === o.city) || indianCities[0];
-
-  for (let i = 0; i < o.workspacesCount; i++) {
-    const wsId = `ws_${o.slug.replace(/-/g, "_")}${o.workspacesCount > 1 ? `_${i === 0 ? "core" : i === 1 ? "sme" : "wealth"}` : ""}`;
-    let wsName = o.name;
-    if (o.workspacesCount === 3 && o.id === "org_meridian_finserv") {
-      wsName = i === 0 ? "Meridian Retail Lending" : i === 1 ? "Meridian SME Credit" : "Meridian Wealth & Insurance";
-    } else if (o.workspacesCount > 1) {
-      wsName = `${o.name} - ${i === 0 ? "Consumer" : "Enterprise Hub"}`;
-    }
-
-    let wsStatus: "kyc_pending" | "kyc_in_review" | "active" | "suspended" = "active";
-    if (o.status === "suspended") wsStatus = "suspended";
-    else if (o.status === "onboarding") wsStatus = i === 0 ? "kyc_in_review" : "kyc_pending";
-
-    // Billing metrics
-    let walletBalance = 0;
-    let creditLimit = 0;
-    let creditUsed = 0;
-
-    if (o.billingModel === "prepaid") {
-      if (o.hasZeroPrepaidBalance) {
-        walletBalance = o.status === "suspended" ? -randomInt(3000, 15000) : randomInt(100, 950);
-      } else {
-        walletBalance = randomInt(25000, 850000);
-      }
-    } else {
-      // Postpaid
-      if (o.id === "org_meridian_finserv") {
-        if (i === 1) {
-          // SME workspace has 88% credit used!
-          creditLimit = 2500000;
-          creditUsed = 2200000; // 88%
-        } else if (i === 0) {
-          creditLimit = 3500000;
-          creditUsed = 1450000; // 41%
-        } else {
-          creditLimit = 1500000;
-          creditUsed = 620000;
-        }
-      } else if (o.creditBurnProfile === "dangerous_high") {
-        creditLimit = randomChoice([1000000, 2000000, 4000000, 6000000]);
-        // 70% to 95% used
-        const pct = randomFloat(0.72, 0.94);
-        creditUsed = Math.round(creditLimit * pct);
-      } else {
-        creditLimit = randomChoice([1000000, 2500000, 5000000, 8000000]);
-        creditUsed = Math.round(creditLimit * randomFloat(0.2, 0.55));
-      }
-    }
-
-    const panChars = `AABC${String.fromCharCode(65 + (wsGlobalIdx % 26))}${randomInt(1000, 9999)}${String.fromCharCode(65 + ((wsGlobalIdx * 3) % 26))}`;
-    const gstin = generateGSTIN(cityInfo.stateCode, panChars);
-
-    workspacesList.push({
-      id: wsId,
-      orgId: o.id,
-      name: wsName,
-      slug: `${o.slug}-${i === 0 ? "prod" : i === 1 ? "sme" : "sec"}`,
-      status: wsStatus,
-      gstin,
-      billingState: cityInfo.state,
-      walletBalance,
-      creditLimit,
-      creditUsed,
-      churnProfile: o.churnProfile || "normal",
-      hasWastedSeats: Boolean(o.hasWastedSeats && i === 0),
-    });
-
-    wsGlobalIdx++;
-  }
-}
-
-console.log(`Generated ${workspacesList.length} total Workspaces across 42 Organizations.`);
-
-const insertWs = sqlite.prepare(`
-  INSERT INTO workspaces (
-    id, org_id, name, slug, status, gstin, billing_state, wallet_balance, credit_limit, credit_used
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-for (const w of workspacesList) {
-  insertWs.run(
-    w.id,
-    w.orgId,
-    w.name,
-    w.slug,
-    w.status,
-    w.gstin,
-    w.billingState,
-    w.walletBalance,
-    w.creditLimit,
-    w.creditUsed
-  );
-}
-
-// ---------------------------------------------------------------------------
-// 9. Subscriptions & Workspace Addons
-// ---------------------------------------------------------------------------
-const insertSub = sqlite.prepare(`
-  INSERT INTO subscriptions (workspace_id, plan_id, custom_price_overrides, discount_pct, discount_reason, effective_from)
-  VALUES (?, ?, ?, ?, ?, ?)
-`);
-
-const insertWsAddon = sqlite.prepare(`
-  INSERT INTO workspace_addons (id, workspace_id, addon_id, quantity, status, start_date, end_date)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
-`);
-
-for (const w of workspacesList) {
-  const org = rawOrgs.find((o) => o.id === w.orgId)!;
-  const hasDiscount = w.orgId === "org_meridian_finserv" || w.creditLimit > 3000000;
-  const discountPct = hasDiscount ? (w.orgId === "org_meridian_finserv" ? 12 : 8) : 0;
-  const discountReason = hasDiscount ? "Enterprise strategic renewal discount" : null;
-
-  insertSub.run(
-    w.id,
-    org.planId,
-    hasDiscount ? JSON.stringify({ sms: 0.10, rcs: 0.16 }) : null,
-    discountPct,
-    discountReason,
-    oneYearAgo
-  );
-
-  // Addons for some workspaces
-  if (w.creditLimit > 2000000 || w.name.includes("Retail") || w.name.includes("Consumer")) {
-    insertWsAddon.run(
-      `wsa_${w.id}_tps`,
-      w.id,
-      "addon_extra_tps_50",
-      randomChoice([1, 2, 4]),
-      "active",
-      oneYearAgo,
-      null
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 10. Workspace Users (3-14 per workspace, with wasted seat scenarios)
-// 6 workspaces with 30-50% of paid seats inactive for >45 days
-// ---------------------------------------------------------------------------
-const insertWsUser = sqlite.prepare(`
-  INSERT INTO workspace_users (id, workspace_id, name, email, tier, custom_role_name, last_login_at, seat_active, is_seat_paid)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const firstNames = ["Aarav", "Vihaan", "Aditi", "Isha", "Rohan", "Neha", "Kunal", "Tanvi", "Siddharth", "Megha", "Varun", "Pooja", "Arjun", "Anika"];
-const lastNames = ["Deshmukh", "Patil", "Agarwal", "Bansal", "Chopra", "Reddy", "Singhania", "Kapoor", "Joshi", "Bhatia", "Saxena", "Iyer"];
-
-const FIFTY_DAYS_AGO = nowSeconds - 52 * 86400;
-const THREE_DAYS_AGO = nowSeconds - 3 * 86400;
-
-for (const w of workspacesList) {
-  const isHero = w.orgId === "org_meridian_finserv";
-  const userCount = isHero ? 10 : randomInt(3, 12);
-
-  // Wasted seat scenario check: 6 specific workspaces have 30-50% inactive seats >45 days
-  const hasWaste = w.hasWastedSeats || (isHero && w.id.includes("sme"));
-  const wasteCount = hasWaste ? Math.ceil(userCount * 0.4) : 0; // 40% waste
-
-  for (let uIdx = 0; uIdx < userCount; uIdx++) {
-    const fn = randomChoice(firstNames);
-    const ln = randomChoice(lastNames);
-    const fullName = `${fn} ${ln}`;
-    const email = `${fn.toLowerCase()}.${ln.toLowerCase()}@${w.slug.split("-")[0]}.in`;
-
-    let tier: "owner" | "admin" | "user" | "custom" = "user";
-    let customRole: string | null = null;
-    if (uIdx === 0) tier = "owner";
-    else if (uIdx === 1) tier = "admin";
-    else if (uIdx === userCount - 1 && userCount > 5) {
-      tier = "custom";
-      customRole = randomChoice(["Campaign Specialist", "DLT Operations Lead", "Billing Analyst"]);
-    }
-
-    const isWasted = uIdx >= userCount - wasteCount;
-    const seatActive = isWasted ? 0 : 1;
-    const isSeatPaid = 1;
-    const lastLogin = isWasted ? FIFTY_DAYS_AGO : randomInt(THREE_DAYS_AGO, nowSeconds);
-
-    insertWsUser.run(
-      `usr_${w.id}_${uIdx + 1}`,
-      w.id,
-      fullName,
-      email,
-      tier,
-      customRole,
-      lastLogin,
-      seatActive,
-      isSeatPaid
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 11. Daily Usage (90 Days per workspace = 5,220 rows)
-// Features weekday/weekend seasonality, festival peaks, and specific trend curves:
-// - 4-5 orgs with declining usage trend >30% over the last 30 days
-// - 5 postpaid workspaces with rising daily burn near credit limit
-// ---------------------------------------------------------------------------
-console.log("Generating 90 days of daily usage history per workspace...");
-
-const insertUsage = sqlite.prepare(`
-  INSERT INTO usage_daily (id, workspace_id, date, sms_count, rcs_count, whatsapp_count, delivered_pct, cost)
+  INSERT INTO users (id, name, email, password_hash, company, role, intent, created_at)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
-const dates90: string[] = [];
-const today = new Date();
-for (let d = 89; d >= 0; d--) {
-  const dt = new Date(today);
-  dt.setDate(today.getDate() - d);
-  dates90.push(dt.toISOString().split("T")[0]);
-}
+insertUser.run(
+  "usr_acmepay_demo",
+  "Aditya Roy",
+  "demo@acmepay.in",
+  demoPasswordHash,
+  "AcmePay Technologies",
+  "Backend dev",
+  "Evaluating Relay",
+  nowEpoch - 86400 * 3
+);
 
-for (const w of workspacesList) {
-  const isDeclining = w.churnProfile === "steep_drop";
-  const isRising = w.creditLimit > 0 && w.creditUsed / (w.creditLimit || 1) >= 0.75;
+sqlite.exec(`
+  INSERT INTO organizations (id, name, legal_name, slug, industry, city, owner_am_id, status, billing_model, plan_id, created_at)
+  VALUES ('org_acmepay', 'AcmePay Technologies', 'AcmePay Technologies Private Limited', 'acmepay-tech', 'Fintech', 'Bengaluru', 'usr_priya_sharma', 'active', 'prepaid', 'plan_starter', ${nowEpoch - 86400 * 3});
 
-  const baseSms = randomInt(5000, 60000);
-  const baseRcs = randomInt(1000, 15000);
-  const baseWa = randomInt(2000, 25000);
+  INSERT INTO workspaces (id, org_id, organization_id, name, slug, status, kyc_status, sender_ids, plan_tier, rate_limit_per_min, monthly_quota, wallet_balance, is_anonymous, gstin, billing_state, created_at)
+  VALUES ('ws_acmepay_prod', 'org_acmepay', 'org_acmepay', 'AcmePay Production', 'acmepay-prod', 'kyc_pending', 'in_review', '["ACMEPY","RELAYI"]', 'growth', 120, 25000, 1250.00, 0, '29AABCA1234F1Z5', 'Karnataka', ${nowEpoch - 86400 * 3});
 
-  for (let dayIdx = 0; dayIdx < 90; dayIdx++) {
-    const curDateStr = dates90[dayIdx];
-    const curDate = new Date(curDateStr);
-    const dayOfWeek = curDate.getDay(); // 0 is Sunday, 6 is Saturday
-    const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+  INSERT INTO usage_alert_preferences (workspace_id, threshold_80, threshold_95, spike_429, low_balance_threshold, email_notifications, notification_email, updated_at)
+  VALUES ('ws_acmepay_prod', 1, 1, 1, 500.0, 1, 'alerts@acmepay.in', ${nowEpoch - 86400});
+`);
 
-    // Weekend factor (lower B2B usage)
-    const weekendMultiplier = isWeekend ? randomFloat(0.45, 0.65) : 1.0;
+// Seed API Keys: 1 Test Key, 1 Live Key (Locked due to kyc_status: in_review)
+const testKeyRaw = "rk_test_acmepay_9fa1b2e84c302948";
+const testKeyHash = crypto.createHash("sha256").update(testKeyRaw).digest("hex");
+const liveKeyRaw = "rk_live_acmepay_72bc910a3948bf82";
+const liveKeyHash = crypto.createHash("sha256").update(liveKeyRaw).digest("hex");
 
-    // Trend multiplier:
-    let trendMultiplier = 1.0;
-    if (isDeclining) {
-      if (dayIdx < 60) {
-        trendMultiplier = 1.05;
-      } else {
-        // Last 30 days: linear decline down to ~55-60% of baseline (severe >30% churn signal)
-        const dropFraction = (dayIdx - 60) / 30; // 0 to 1
-        trendMultiplier = 1.05 - dropFraction * 0.48; // drops to ~0.57
-      }
-    } else if (isRising) {
-      if (dayIdx >= 60) {
-        // Rapid growth in last 30 days (surging burn)
-        const surgeFraction = (dayIdx - 60) / 30;
-        trendMultiplier = 1.0 + surgeFraction * 0.65;
-      }
-    }
+sqlite.exec(`
+  INSERT INTO api_keys (id, workspace_id, name, prefix, hashed_secret, secret_masked, full_key_for_dev, environment, scopes, status, created_at, last_used_at, created_by)
+  VALUES
+  ('key_test_acmepay_default', 'ws_acmepay_prod', 'Default Sandbox Key', 'rk_test_', '${testKeyHash}', 'rk_test_••••••••••••9fa1', '${testKeyRaw}', 'test', '["messages:send","events:write","profiles:read"]', 'active', ${nowEpoch - 86400 * 3}, ${nowEpoch - 300}, 'usr_acmepay_demo'),
+  ('key_live_acmepay_primary', 'ws_acmepay_prod', 'Primary Production Key (Locked)', 'rk_live_', '${liveKeyHash}', 'rk_live_••••••••••••72bc', '${liveKeyRaw}', 'live', '["messages:send","events:write","profiles:read"]', 'active', ${nowEpoch - 86400 * 2}, NULL, 'usr_acmepay_demo');
 
-    const noise = randomFloat(0.88, 1.12);
+  INSERT INTO api_key_audit_logs (id, key_id, workspace_id, action, actor, details, created_at)
+  VALUES
+  ('akal_test_01', 'key_test_acmepay_default', 'ws_acmepay_prod', 'created', 'Aditya Roy (demo@acmepay.in)', '{"scopes":["messages:send","events:write","profiles:read"],"preset":"Default"}', ${nowEpoch - 86400 * 3}),
+  ('akal_live_01', 'key_live_acmepay_primary', 'ws_acmepay_prod', 'created', 'Aditya Roy (demo@acmepay.in)', '{"scopes":["messages:send","events:write","profiles:read"],"preset":"Default"}', ${nowEpoch - 86400 * 2});
+`);
 
-    const smsCount = Math.round(baseSms * weekendMultiplier * trendMultiplier * noise);
-    const rcsCount = Math.round(baseRcs * weekendMultiplier * trendMultiplier * noise);
-    const waCount = Math.round(baseWa * weekendMultiplier * trendMultiplier * noise);
+console.log("✅ Seeded demo user 'demo@acmepay.in', organization, workspace, and API keys.");
 
-    const deliveredPct = randomFloat(98.1, 99.9);
-    // Cost calculation (SMS @ ₹0.12, RCS @ ₹0.20, WA @ ₹0.35)
-    const cost = Math.round(smsCount * 0.12 + rcsCount * 0.20 + waCount * 0.35);
+// ---------------------------------------------------------------------------
+// 5. Seed Pre-loaded Webhook Endpoints & The Two Debuggable Failures
+// ---------------------------------------------------------------------------
+// Endpoint 1: message.delivered failing with 500 stack trace (due to null failure_reason)
+const ep1Secret = "whsec_acmepay_hooks_a8912b";
+// Endpoint 2: customer.profile.updated failing with 401 signature rejection
+const ep2Secret = "whsec_acmepay_live_9fa1b2e84c302948";
+// Endpoint 3: healthy delivery endpoint
+const ep3Secret = "whsec_acmepay_events_healthy";
 
-    insertUsage.run(
-      `ud_${w.id}_${curDateStr}`,
-      w.id,
-      curDateStr,
-      smsCount,
-      rcsCount,
-      waCount,
-      deliveredPct,
-      cost
-    );
+sqlite.exec(`
+  INSERT INTO webhook_endpoints (id, workspace_id, url, environment, events, signing_secret, status, api_version, created_at, consecutive_failures) VALUES
+  ('wh_ep_acmepay_messages', 'ws_acmepay_prod', 'https://api.acmepay.in/hooks/relay', 'test', '["message.delivered","message.failed"]', '${ep1Secret}', 'failing', 'v2025-10-01', ${nowEpoch - 86400 * 2}, 3),
+  ('wh_ep_acmepay_profiles', 'ws_acmepay_prod', 'https://hooks.acmepay.in/relay', 'test', '["customer.profile.updated"]', '${ep2Secret}', 'failing', 'v2025-10-01', ${nowEpoch - 86400 * 2}, 5),
+  ('wh_ep_acmepay_events', 'ws_acmepay_prod', 'https://events.acmepay.in/relay/ingest', 'test', '["event.ingested","message.queued"]', '${ep3Secret}', 'active', 'v2025-10-01', ${nowEpoch - 86400 * 3}, 0);
+`);
+
+// Failure Case 1: Null field crash (message.delivered with failure_reason: null)
+const ep1Payload = JSON.stringify({
+  event: "message.delivered",
+  message_id: "msg_01JB9X7V2T4KZQ8M",
+  channel: "sms",
+  recipient: "+919876543210",
+  sender_id: "ACMEPY",
+  status: "delivered",
+  delivered_at: "2026-10-29T20:10:00Z",
+  carrier: "Bharti Airtel",
+  circle: "Karnataka",
+  failure_reason: null, // ROOT CAUSE: Customer server calls failure_reason.toString()
+  metadata: {
+    transaction_id: "txn_acmepay_9901",
+    user_id: "usr_7718"
   }
-}
-
-// ---------------------------------------------------------------------------
-// 12. Invoices & Wallet Transactions
-// - 3 postpaid orgs with overdue invoices (15-60 days late)
-// - 2 with disputed invoices caused by seat count mismatch
-// - Wallet transactions for prepaid workspaces
-// ---------------------------------------------------------------------------
-const insertInvoice = sqlite.prepare(`
-  INSERT INTO invoices (id, workspace_id, period, amount, gst_amount, status, issued_at, due_at, paid_at, line_items)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const insertWalletTx = sqlite.prepare(`
-  INSERT INTO wallet_transactions (id, workspace_id, type, amount, balance_after, reference, created_by, created_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-let invCounter = 1001;
-
-for (const w of workspacesList) {
-  const org = rawOrgs.find((o) => o.id === w.orgId)!;
-
-  if (org.billingModel === "postpaid") {
-    // Generate 3 past months invoices
-    const periods = ["Jul 2026", "Aug 2026", "Sep 2026"];
-
-    for (let pIdx = 0; pIdx < periods.length; pIdx++) {
-      const p = periods[pIdx];
-      const invId = `inv_${invCounter++}`;
-      const amount = randomInt(180000, 1450000);
-      const gst = Math.round(amount * 0.18);
-
-      const issuedAt = nowSeconds - (3 - pIdx) * 30 * 86400;
-      const dueAt = issuedAt + 15 * 86400;
-
-      let status: "issued" | "paid" | "overdue" | "disputed" = "paid";
-      let paidAt: number | null = dueAt - randomInt(1, 5) * 86400;
-
-      if (pIdx === 2) {
-        // Most recent invoice (Sep 2026)
-        if (org.hasOverdueInvoice) {
-          status = "overdue";
-          paidAt = null;
-        } else if (org.hasDisputedInvoice) {
-          status = "disputed";
-          paidAt = null;
-        } else {
-          status = "issued";
-          paidAt = null;
-        }
-      }
-
-      const lineItems = JSON.stringify([
-        { desc: "Transactional & OTP SMS Delivery", amount: Math.round(amount * 0.6) },
-        { desc: "WhatsApp Cloud API Messaging", amount: Math.round(amount * 0.3) },
-        { desc: "Platform Base Fee & User Seats", amount: Math.round(amount * 0.1) },
-      ]);
-
-      insertInvoice.run(invId, w.id, p, amount, gst, status, issuedAt, dueAt, paidAt, lineItems);
-    }
-  } else {
-    // Prepaid wallet history
-    const topupAmount = randomInt(50000, 200000);
-    insertWalletTx.run(
-      `wt_${w.id}_1`,
-      w.id,
-      "topup",
-      topupAmount,
-      w.walletBalance + 45000,
-      "NEFT/RAZORPAY_RECHARGE_9901",
-      "Auto-Billing Daemon",
-      nowSeconds - 14 * 86400
-    );
-    insertWalletTx.run(
-      `wt_${w.id}_2`,
-      w.id,
-      "usage",
-      -45000,
-      w.walletBalance,
-      "Daily Message Consumption Cutoff",
-      "System Daemon",
-      nowSeconds - 1 * 86400
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 13. Credit History
-// ---------------------------------------------------------------------------
-const insertCreditHist = sqlite.prepare(`
-  INSERT INTO credit_history (id, workspace_id, old_limit, new_limit, reason, changed_by, approved_by, created_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const meridianSmeWs = workspacesList.find((w) => w.orgId === "org_meridian_finserv" && w.id.includes("sme")) || workspacesList[0];
-const payvantageWs = workspacesList.find((w) => w.orgId === "org_payvantage") || workspacesList[1];
-
-insertCreditHist.run(
-  "ch_101",
-  meridianSmeWs.id,
-  1500000,
-  2500000,
-  "Diwali MSME festive disbursal campaign capacity ramp-up",
-  "Rohan Verma (Account Manager)",
-  "Rajesh Nair (Finance Head)",
-  nowSeconds - 45 * 86400
-);
-
-insertCreditHist.run(
-  "ch_102",
-  payvantageWs.id,
-  3000000,
-  5000000,
-  "Contract renewal with 66% limit expansion",
-  "Priya Sharma (Account Manager)",
-  "Rajesh Nair (Finance Head)",
-  nowSeconds - 60 * 86400
-);
-
-// ---------------------------------------------------------------------------
-// 14. Support & Operations Tickets (2-8 per org, open & breached)
-// ---------------------------------------------------------------------------
-const insertTicket = sqlite.prepare(`
-  INSERT INTO tickets (id, org_id, subject, priority, status, category, created_at, resolved_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const ticketTemplates = [
-  { subj: "Delivery drop on Vodafone-Idea (Vi) DLT circle", cat: "api_delivery", prio: "high" },
-  { subj: "Overdue payment grace period extension request", cat: "billing", prio: "urgent" },
-  { subj: "Dispute over unallocated seats charged on Sep invoice", cat: "seat_dispute", prio: "high" },
-  { subj: "Request for urgent credit limit buffer expansion", cat: "credit_limit", prio: "urgent" },
-  { subj: "DLT Principal Entity header approval delay", cat: "dlt_compliance", prio: "medium" },
-  { subj: "Webhook signature verification HMAC failure", cat: "general", prio: "medium" },
-];
-
-let tktCounter = 2001;
-for (const o of rawOrgs) {
-  const count = o.id === "org_meridian_finserv" ? 6 : randomInt(2, 5);
-
-  for (let t = 0; t < count; t++) {
-    const tmpl = randomChoice(ticketTemplates);
-    const isHero = o.id === "org_meridian_finserv";
-    const status = isHero && t === 0 ? "open" : randomChoice(["open", "in_progress", "resolved", "closed"]);
-    const prio = isHero && t === 0 ? "urgent" : tmpl.prio;
-    const createdAt = nowSeconds - randomInt(2, 35) * 86400;
-    const resolvedAt = status === "resolved" || status === "closed" ? createdAt + randomInt(1, 4) * 86400 : null;
-
-    insertTicket.run(
-      `tkt_${tktCounter++}`,
-      o.id,
-      t === 0 && isHero ? "Seat mismatch dispute on September invoice #INV-1001" : tmpl.subj,
-      prio,
-      status,
-      t === 0 && isHero ? "seat_dispute" : tmpl.cat,
-      createdAt,
-      resolvedAt
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// 15. KYC Cases (6 cases in different states, 2 SLA breached >5 days)
-// References the generated sample docs in /sample-docs/
-// ---------------------------------------------------------------------------
-const insertKyc = sqlite.prepare(`
-  INSERT INTO kyc_cases (id, workspace_id, status, submitted_at, assigned_to, documents, declared_data, sla_due_at, notes)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const meridianCoreWs = workspacesList.find((w) => w.orgId === "org_meridian_finserv")!;
-const zenithWs = workspacesList.find((w) => w.orgId === "org_zenithlogistics")!;
-const omniWs = workspacesList.find((w) => w.orgId === "org_omniinsure")!;
-const ayurlifeWs = workspacesList.find((w) => w.orgId === "org_ayurlife")!;
-const skoolboxWs = workspacesList.find((w) => w.orgId === "org_skoolbox")!;
-const carepulseWs = workspacesList.find((w) => w.orgId === "org_carepulse")!;
-
-// Case 1: Meridian Finserv (Approved, verified against MCA)
-insertKyc.run(
-  "kyc_101",
-  meridianCoreWs.id,
-  "approved",
-  nowSeconds - 12 * 86400,
-  "usr_comp_kavita",
-  JSON.stringify([
-    {
-      type: "gst_certificate",
-      filename: "/sample-docs/gst_certificate_meridian.pdf",
-      extractedData: { gstin: "27AABCM8822K1Z9", legalName: "MERIDIAN FINANCIAL SERVICES PRIVATE LIMITED" },
-    },
-    {
-      type: "pan_card",
-      filename: "/sample-docs/pan_card_meridian.pdf",
-      extractedData: { pan: "AABCM8822K", category: "Company" },
-    },
-  ]),
-  JSON.stringify({
-    legalName: "MERIDIAN FINANCIAL SERVICES PRIVATE LIMITED",
-    gstin: "27AABCM8822K1Z9",
-    pan: "AABCM8822K",
-    state: "Maharashtra",
-    directorName: "Siddharth Deshmukh",
-  }),
-  nowSeconds - 9 * 86400,
-  "Verified against MCA21 and GST portal. All documents match."
-);
-
-// Case 2: Zenith Express Logistics (REJECTED due to deliberate name mismatch in doc 3!)
-insertKyc.run(
-  "kyc_102",
-  zenithWs.id,
-  "rejected",
-  nowSeconds - 8 * 86400,
-  "usr_comp_suresh",
-  JSON.stringify([
-    {
-      type: "incorporation_cert",
-      filename: "/sample-docs/incorporation_certificate_zenith.pdf",
-      extractedData: {
-        legalName: "ZENITH LOGISTICS CLOUD INDIA PRIVATE LIMITED",
-        cin: "U72900KA2021PTC148892",
-      },
-    },
-  ]),
-  JSON.stringify({
-    legalName: "Zenith Express Logistics Ltd", // MISMATCH!
-    gstin: "29AAFCZ4491J1Z8",
-    pan: "AAFCZ4491J",
-    state: "Karnataka",
-    directorName: "Rohan Kapoor",
-  }),
-  nowSeconds - 5 * 86400,
-  "REJECTED: Declared entity name 'Zenith Express Logistics Ltd' does not match Certificate of Incorporation legal name 'ZENITH LOGISTICS CLOUD INDIA PRIVATE LIMITED'."
-);
-
-// Case 3: OmniInsure Tech (In Review, SLA BREACHED > 7 days!)
-insertKyc.run(
-  "kyc_103",
-  omniWs.id,
-  "in_review",
-  nowSeconds - 7 * 86400, // 7 days ago!
-  "usr_comp_kavita",
-  JSON.stringify([
-    {
-      type: "gst_certificate",
-      filename: "/sample-docs/gst_certificate_meridian.pdf",
-      extractedData: { state: "Karnataka" },
-    },
-  ]),
-  JSON.stringify({
-    legalName: "OMNIINSURE UNDERWRITERS INDIA PVT LTD",
-    gstin: "29AABCO9911K1Z2",
-    pan: "AABCO9911K",
-    state: "Karnataka",
-    directorName: "Aditi Chopra",
-  }),
-  nowSeconds - 2 * 86400, // SLA breached by 2 days!
-  "SLA BREACHED: Waiting on internal compliance review for WABA Business verification."
-);
-
-// Case 4: AyurLife Organics (In Review, SLA BREACHED > 6 days!)
-insertKyc.run(
-  "kyc_104",
-  ayurlifeWs.id,
-  "in_review",
-  nowSeconds - 6 * 86400, // 6 days ago!
-  "usr_comp_suresh",
-  JSON.stringify([]),
-  JSON.stringify({
-    legalName: "AYURLIFE WELLNESS LABS PVT LTD",
-    gstin: "27AABCA3311E1Z4",
-    pan: "AABCA3311E",
-    state: "Maharashtra",
-    directorName: "Vihaan Patil",
-  }),
-  nowSeconds - 1 * 86400, // SLA breached!
-  "SLA BREACHED: FSSAI registration cert submitted; awaiting tax verification."
-);
-
-// Case 5: SkoolBox Robotics (Needs Info)
-insertKyc.run(
-  "kyc_105",
-  skoolboxWs.id,
-  "needs_info",
-  nowSeconds - 3 * 86400,
-  "usr_comp_kavita",
-  JSON.stringify([]),
-  JSON.stringify({
-    legalName: "SKOOLBOX STEM INNOVATIONS PVT LTD",
-    gstin: "36AABCS7711N1Z5",
-    pan: "AABCS7711N",
-    state: "Telangana",
-    directorName: "Kunal Bansal",
-  }),
-  nowSeconds + 2 * 86400,
-  "Director PAN card signature blurred. Requested high-resolution re-upload."
-);
-
-// Case 6: CarePulse Healthtech (Approved)
-insertKyc.run(
-  "kyc_106",
-  carepulseWs.id,
-  "approved",
-  nowSeconds - 18 * 86400,
-  "usr_comp_suresh",
-  JSON.stringify([]),
-  JSON.stringify({
-    legalName: "CAREPULSE TELEHEALTH INDIA PVT LTD",
-    gstin: "29AABCC1122M1Z9",
-    pan: "AABCC1122M",
-    state: "Karnataka",
-    directorName: "Megha Reddy",
-  }),
-  nowSeconds - 15 * 86400,
-  "Approved regular healthcare provider tier."
-);
-
-// ---------------------------------------------------------------------------
-// 16. Sender IDs & Templates
-// - At least 5 sender-IDs (including MRDFIN which is SLA breached)
-// - At least 8 templates
-// ---------------------------------------------------------------------------
-const insertSenderId = sqlite.prepare(`
-  INSERT INTO sender_ids (id, workspace_id, header, channel, status, submitted_at, approved_at, rejection_reason)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const kuberWs = workspacesList.find((w) => w.orgId === "org_kubermf")!;
-const zippymartWs = workspacesList.find((w) => w.orgId === "org_zippymart")!;
-
-insertSenderId.run(
-  "sid_101",
-  meridianCoreWs.id,
-  "MRDFIN",
-  "sms",
-  "submitted",
-  nowSeconds - 7 * 86400, // SLA breached (7 days ago!)
-  null,
-  null
-);
-
-insertSenderId.run(
-  "sid_102",
-  payvantageWs.id,
-  "PAYVAN",
-  "sms",
-  "approved",
-  nowSeconds - 25 * 86400,
-  nowSeconds - 23 * 86400,
-  null
-);
-
-insertSenderId.run(
-  "sid_103",
-  zenithWs.id,
-  "ZENTHL",
-  "sms",
-  "rejected",
-  nowSeconds - 10 * 86400,
-  null,
-  "DLT Principal Entity registration number invalid on Jio DLT portal"
-);
-
-insertSenderId.run(
-  "sid_104",
-  kuberWs.id,
-  "KUBERM",
-  "rcs",
-  "in_review",
-  nowSeconds - 2 * 86400,
-  null,
-  null
-);
-
-insertSenderId.run(
-  "sid_105",
-  zippymartWs.id,
-  "ZIPPYM",
-  "whatsapp",
-  "approved",
-  nowSeconds - 30 * 86400,
-  nowSeconds - 28 * 86400,
-  null
-);
-
-const insertTemplate = sqlite.prepare(`
-  INSERT INTO templates (id, workspace_id, name, category, body, dlt_template_id, status, submitted_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-`);
-
-const sampleTemplates = [
-  { name: "otp_login_v1", cat: "otp", body: "Your Meridian Finserv verification code is {#var#}. Valid for 10 minutes. Do not share.", dlt: "1107161234567890", status: "approved" },
-  { name: "loan_disbursal_alert", cat: "transactional", body: "Dear {#var#}, your loan of Rs. {#var#} has been approved and credited to A/C ending {#var#}. Meridian Finserv.", dlt: "1107161234567891", status: "approved" },
-  { name: "diwali_festive_offer", cat: "promotional", body: "Special Festive Offer! Get instant personal loans up to Rs 5 Lakhs at 10.5% interest. Apply now on Meridian App.", dlt: "1107161234567892", status: "submitted" },
-  { name: "order_delivered_rcs", cat: "service", body: "Your order #{#var#} has been delivered. Rate your delivery partner here: {#var#}", dlt: "1107161234567893", status: "approved" },
-  { name: "emi_payment_reminder", cat: "service", body: "Reminder: Your EMI of Rs {#var#} is due on {#var#}. Avoid late fees by paying via UPI: {#var#}", dlt: "1107161234567894", status: "approved" },
-  { name: "password_reset_code", cat: "otp", body: "Your security OTP to reset password is {#var#}. Do not disclose to anyone. PayVantage.", dlt: "1107161234567895", status: "approved" },
-  { name: "kyc_status_update", cat: "transactional", body: "Dear customer, your KYC verification status is {#var#}. Visit {#var#} to complete required actions.", dlt: "1107161234567896", status: "in_review" },
-  { name: "flight_web_checkin", cat: "service", body: "Web check-in for flight {#var#} is now open. Confirm your seats at {#var#}. YatraWings.", dlt: "1107161234567897", status: "approved" },
-];
-
-sampleTemplates.forEach((t, idx) => {
-  insertTemplate.run(
-    `tmpl_${idx + 101}`,
-    idx < 3 ? meridianCoreWs.id : workspacesList[idx].id,
-    t.name,
-    t.cat,
-    t.body,
-    t.dlt,
-    t.status,
-    nowSeconds - randomInt(4, 30) * 86400
-  );
 });
 
-// ---------------------------------------------------------------------------
-// 17. Change Requests (3 pending dual-approvals so approvals queue isn't empty)
-// ---------------------------------------------------------------------------
-const insertChangeReq = sqlite.prepare(`
-  INSERT INTO change_requests (
-    id, type, target_type, target_id, payload, status, requested_by, approver_role_needed, approved_by, reason, decision_note, created_at, decided_at, expires_at
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+const ep1StackTrace = `TypeError: Cannot read properties of null (reading 'toString')
+    at PaymentHookHandler.handleDeliveryReceipt (src/webhooks/relay.ts:54:32)
+    at Layer.handle [as handle_request] (node_modules/express/lib/router/layer.js:95:5)
+    at next (node_modules/express/lib/router/route.js:144:13)
+    at jsonParser (node_modules/body-parser/lib/types/json.js:110:7)
+    at Layer.handle [as handle_request] (node_modules/express/lib/router/layer.js:95:5)`;
+
+const ep1Timestamp = nowEpoch - 3600;
+const ep1SignedString = `${ep1Timestamp}.${ep1Payload}`;
+const ep1ValidHmac = crypto.createHmac("sha256", ep1Secret).update(ep1SignedString).digest("hex");
+const ep1Headers = JSON.stringify({
+  "content-type": "application/json",
+  "relay-signature": `t=${ep1Timestamp},v1=${ep1ValidHmac}`,
+  "user-agent": "Relay-Webhook-Dispatcher/2.0"
+});
+
+sqlite.exec(`
+  INSERT INTO webhook_events (id, workspace_id, endpoint_id, type, payload, created_at, api_version)
+  VALUES ('whevt_msg_deliv_01', 'ws_acmepay_prod', 'wh_ep_acmepay_messages', 'message.delivered', '${ep1Payload.replace(/'/g, "''")}', ${nowEpoch - 3600}, 'v2025-10-01');
+
+  -- Attempt 1 (Failed 500)
+  INSERT INTO webhook_deliveries (id, event_id, endpoint_id, workspace_id, attempt_number, request_headers, request_body, response_status, response_headers, response_body, duration_ms, error_type, status, scheduled_at, attempted_at, next_retry_at)
+  VALUES ('del_ep1_att1', 'whevt_msg_deliv_01', 'wh_ep_acmepay_messages', 'ws_acmepay_prod', 1, '${ep1Headers.replace(/'/g, "''")}', '${ep1Payload.replace(/'/g, "''")}', 500, '{"content-type":"text/plain; charset=utf-8"}', '${ep1StackTrace.replace(/'/g, "''")}', 142, 'http_5xx', 'retrying', ${nowEpoch - 3600}, ${nowEpoch - 3599}, ${nowEpoch - 3300});
+
+  -- Attempt 2 (Failed 500)
+  INSERT INTO webhook_deliveries (id, event_id, endpoint_id, workspace_id, attempt_number, request_headers, request_body, response_status, response_headers, response_body, duration_ms, error_type, status, scheduled_at, attempted_at, next_retry_at)
+  VALUES ('del_ep1_att2', 'whevt_msg_deliv_01', 'wh_ep_acmepay_messages', 'ws_acmepay_prod', 2, '${ep1Headers.replace(/'/g, "''")}', '${ep1Payload.replace(/'/g, "''")}', 500, '{"content-type":"text/plain; charset=utf-8"}', '${ep1StackTrace.replace(/'/g, "''")}', 138, 'http_5xx', 'retrying', ${nowEpoch - 3300}, ${nowEpoch - 3299}, ${nowEpoch - 1800});
+
+  -- Attempt 3 (Failed 500 - currently scheduled for retry in 15 minutes)
+  INSERT INTO webhook_deliveries (id, event_id, endpoint_id, workspace_id, attempt_number, request_headers, request_body, response_status, response_headers, response_body, duration_ms, error_type, status, scheduled_at, attempted_at, next_retry_at)
+  VALUES ('del_ep1_att3', 'whevt_msg_deliv_01', 'wh_ep_acmepay_messages', 'ws_acmepay_prod', 3, '${ep1Headers.replace(/'/g, "''")}', '${ep1Payload.replace(/'/g, "''")}', 500, '{"content-type":"text/plain; charset=utf-8"}', '${ep1StackTrace.replace(/'/g, "''")}', 155, 'http_5xx', 'retrying', ${nowEpoch - 1800}, ${nowEpoch - 1799}, ${nowEpoch + 900});
 `);
 
-const fintrackWs = workspacesList.find((w) => w.orgId === "org_fintrack")!;
+// Failure Case 2: Signature verification mismatch (Customer re-serialized body before verifying)
+const ep2RawBody = JSON.stringify({
+  event: "customer.profile.updated",
+  profile_id: "prf_acme_9921",
+  external_id: "cust_acmepay_7710",
+  updated_fields: ["phone", "kyc_tier"],
+  traits: {
+    tier: "gold",
+    kyc_verified: true,
+    upi_vpa: "rahul@okaxis"
+  },
+  timestamp: "2026-10-29T18:45:00Z"
+});
 
-// 1. Credit Limit Raise: Meridian SME Credit from ₹25L to ₹45L
-insertChangeReq.run(
-  "cr_101",
-  "credit_limit_increase",
-  "workspace",
-  meridianSmeWs.id,
-  JSON.stringify({
-    workspaceName: "Meridian SME Credit",
-    currentCreditLimit: 2500000,
-    requestedCreditLimit: 4500000,
-    creditUsed: 2200000,
-    increasePct: 80,
-  }),
-  "pending",
-  "usr_am_rohan",
-  "finance_head",
-  null,
-  "Meridian SME Credit has reached 88% credit utilization. Upcoming Diwali merchant advance campaigns will breach ceiling in 4 days. Requesting ₹45L limit hike.",
-  null,
-  nowSeconds - 1 * 86400,
-  null,
-  nowSeconds + 5 * 86400
-);
+const ep2Timestamp = nowEpoch - 7200;
+const ep2SignedString = `${ep2Timestamp}.${ep2RawBody}`;
+const ep2ValidHmac = crypto.createHmac("sha256", ep2Secret).update(ep2SignedString).digest("hex");
+const ep2Headers = JSON.stringify({
+  "content-type": "application/json",
+  "relay-signature": `t=${ep2Timestamp},v1=${ep2ValidHmac}`,
+  "user-agent": "Relay-Webhook-Dispatcher/2.0"
+});
 
-// 2. Custom Discount: 15% discount for FinTrack Payments
-insertChangeReq.run(
-  "cr_102",
-  "custom_discount",
-  "workspace",
-  fintrackWs.id,
-  JSON.stringify({
-    workspaceName: "FinTrack Lending",
-    currentDiscountPct: 0,
-    requestedDiscountPct: 15,
-    projectedMonthlyVolume: 25000000,
-  }),
-  "pending",
-  "usr_ops_amit",
-  "finance",
-  null,
-  "Competitive defense against Exotel/Gupshup. Client promised 2.5 Crore monthly messaging commitment if 15% discount approved.",
-  null,
-  nowSeconds - 2 * 86400,
-  null,
-  nowSeconds + 4 * 86400
-);
+const ep2ResponseBody = JSON.stringify({
+  error: "Unauthorized",
+  message: "invalid signature: calculated hash 7a8f90... does not match provided v1 header"
+});
 
-// 3. Account Suspension: QuickDrop Courier due to negative wallet balance
-insertChangeReq.run(
-  "cr_103",
-  "account_suspension",
-  "organization",
-  "org_quickdrop",
-  JSON.stringify({
-    organizationName: "QuickDrop Courier",
-    negativeBalance: -3450,
-    unpaidInvoicesCount: 1,
-  }),
-  "pending",
-  "usr_fin_vikram",
-  "compliance",
-  null,
-  "Prepaid balance depleted and negative for 12 days. Client uncontactable on registered phone number.",
-  null,
-  nowSeconds - 12 * 3600,
-  null,
-  nowSeconds + 2 * 86400
-);
+sqlite.exec(`
+  INSERT INTO webhook_events (id, workspace_id, endpoint_id, type, payload, created_at, api_version)
+  VALUES ('whevt_prof_upd_01', 'ws_acmepay_prod', 'wh_ep_acmepay_profiles', 'customer.profile.updated', '${ep2RawBody.replace(/'/g, "''")}', ${ep2Timestamp}, 'v2025-10-01');
 
-// ---------------------------------------------------------------------------
-// 18. Audit Log (~42 realistic entries with cryptographic hash chain)
-// ---------------------------------------------------------------------------
-const insertAuditLog = sqlite.prepare(`
-  INSERT INTO audit_log (
-    id, timestamp, actor_id, actor_role, action, target_type, target_id, org_id, before, after, reason, change_request_id, ai_assisted, ip, prev_hash, hash, is_denied
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO webhook_deliveries (id, event_id, endpoint_id, workspace_id, attempt_number, request_headers, request_body, response_status, response_headers, response_body, duration_ms, error_type, status, scheduled_at, attempted_at, next_retry_at)
+  VALUES ('del_ep2_att1', 'whevt_prof_upd_01', 'wh_ep_acmepay_profiles', 'ws_acmepay_prod', 1, '${ep2Headers.replace(/'/g, "''")}', '${ep2RawBody.replace(/'/g, "''")}', 401, '{"content-type":"application/json"}', '${ep2ResponseBody.replace(/'/g, "''")}', 92, 'signature_rejected', 'failed', ${ep2Timestamp}, ${ep2Timestamp + 1}, NULL);
 `);
 
-function seedComputeAuditHash(
-  prevHash: string,
-  entry: {
-    id: string;
-    timestamp: number;
-    actorId: string;
-    actorRole: string;
-    action: string;
-    targetType: string;
-    targetId: string;
-    orgId?: string | null;
-    before?: string | null;
-    after?: string | null;
-    reason: string;
-    aiAssisted?: boolean | number;
-    isDenied?: boolean | number;
-  }
-): string {
-  const payload = [
-    prevHash,
-    entry.id,
-    String(entry.timestamp),
-    entry.actorId,
-    entry.actorRole,
-    entry.action,
-    entry.targetType,
-    entry.targetId,
-    entry.orgId || "",
-    entry.before || "",
-    entry.after || "",
-    entry.reason.trim(),
-    entry.aiAssisted ? "1" : "0",
-    entry.isDenied ? "1" : "0",
-  ].join("|");
-
-  return createHash("sha256").update(payload).digest("hex");
-}
-
-const sampleAuditActions = [
-  {
-    action: "credit_limit_updated",
-    type: "workspace",
-    reason: "Annual enterprise contract renewal with 25% credit limit expansion",
-    actor: "usr_fin_vikram",
-    role: "finance",
-    before: { creditLimit: 2000000, creditUsed: 1450000 },
-    after: { creditLimit: 2500000, creditUsed: 1450000 },
-    isDenied: 0,
-  },
-  {
-    action: "kyc_document_verified",
-    type: "workspace",
-    reason: "Verified Certificate of Incorporation against Ministry of Corporate Affairs portal",
-    actor: "usr_comp_kavita",
-    role: "compliance",
-    before: { kycStatus: "in_review", verifiedAt: null },
-    after: { kycStatus: "approved", verifiedAt: "2026-10-28T10:00:00Z" },
-    isDenied: 0,
-  },
-  {
-    action: "plan_upgraded",
-    type: "organization",
-    reason: "Customer upgraded from Growth to Scale for higher throughput",
-    actor: "usr_ops_amit",
-    role: "sales_ops",
-    before: { plan: "Starter", mps: 50 },
-    after: { plan: "Scale", mps: 200 },
-    isDenied: 0,
-  },
-  {
-    action: "sender_id_approved",
-    type: "workspace",
-    reason: "DLT Principal Entity header verified on Airtel circle",
-    actor: "usr_comp_suresh",
-    role: "compliance",
-    before: { status: "submitted" },
-    after: { status: "approved" },
-    isDenied: 0,
-  },
-  {
-    action: "unauthorized_discount_override_denied",
-    type: "organization",
-    reason: "AM attempted 22% discount without Sales Ops Manager dual approval. Policy blocked mutation.",
-    actor: "usr_am_priya",
-    role: "account_manager",
-    before: { discountPct: 0 },
-    after: { error: "Maker-Checker Guard: Discount exceeds 10% maximum self-approval threshold" },
-    isDenied: 1,
-  },
-  {
-    action: "invoice_issued",
-    type: "workspace",
-    reason: "Monthly automated postpaid billing batch run for September consumption",
-    actor: "usr_fin_sneha",
-    role: "finance",
-    before: { draftStatus: "draft" },
-    after: { draftStatus: "issued", totalAmount: 476594 },
-    isDenied: 0,
-  },
-  {
-    action: "seat_count_adjusted",
-    type: "workspace",
-    reason: "Deactivated 3 unused developer seats upon customer request",
-    actor: "usr_sup_rahul",
-    role: "support",
-    before: { activeSeats: 12 },
-    after: { activeSeats: 9 },
-    isDenied: 0,
-  },
-  {
-    action: "custom_rate_card_applied",
-    type: "workspace",
-    reason: "Approved bulk SMS rate discount of 2 paise per message for high volume commitment",
-    actor: "usr_ops_divya",
-    role: "sales_ops",
-    before: { smsRate: 0.14 },
-    after: { smsRate: 0.12 },
-    isDenied: 0,
-  },
-  {
-    action: "unauthorized_credit_hike_denied",
-    type: "workspace",
-    reason: "Attempted credit hike of ₹8,00,000 on account with active overdue invoice. Maker-checker blocked.",
-    actor: "usr_am_rohan",
-    role: "account_manager",
-    before: { creditLimit: 2500000 },
-    after: { error: "Overdue Invoice Guard: Accounts with unpaid past-due invoices require Finance Head authorization" },
-    isDenied: 1,
-  },
-  {
-    action: "ticket_escalated",
-    type: "organization",
-    reason: "Urgent delivery drop ticket escalated to Tier 3 telecom NOC",
-    actor: "usr_sup_pooja",
-    role: "support",
-    before: { priority: "medium", tier: 1 },
-    after: { priority: "critical", tier: 3 },
-    isDenied: 0,
-  },
-];
-
-let runningPrevHash = "0000000000000000000000000000000000000000000000000000000000000000";
-
-for (let aIdx = 0; aIdx < 42; aIdx++) {
-  const item = sampleAuditActions[aIdx % sampleAuditActions.length];
-  const targetWs = workspacesList[aIdx % workspacesList.length];
-  const ts = nowSeconds - (42 - aIdx) * 18 * 3600;
-  const id = `aud_${1000 + aIdx}`;
-  const reason = aIdx === 0 ? "Initial system onboarding configuration audit baseline" : item.reason;
-  const aiAssisted = aIdx % 5 === 0 ? 1 : 0;
-  const isDenied = item.isDenied ? 1 : 0;
-  const beforeStr = JSON.stringify(item.before);
-  const afterStr = JSON.stringify(item.after);
-  const ip = `10.14.0.${20 + (aIdx % 50)}`;
-
-  const currentHash = seedComputeAuditHash(runningPrevHash, {
-    id,
-    timestamp: ts,
-    actorId: item.actor,
-    actorRole: item.role,
-    action: item.action,
-    targetType: item.type,
-    targetId: targetWs.id,
-    orgId: targetWs.orgId,
-    before: beforeStr,
-    after: afterStr,
-    reason,
-    aiAssisted,
-    isDenied,
-  });
-
-  insertAuditLog.run(
-    id,
-    ts,
-    item.actor,
-    item.role,
-    item.action,
-    item.type,
-    targetWs.id,
-    targetWs.orgId,
-    beforeStr,
-    afterStr,
-    reason,
-    null,
-    aiAssisted,
-    ip,
-    runningPrevHash,
-    currentHash,
-    isDenied
-  );
-
-  runningPrevHash = currentHash;
-}
-
-// ---------------------------------------------------------------------------
-// 19. AI Runs & Tasks
-// ---------------------------------------------------------------------------
-const insertAiRun = sqlite.prepare(`
-  INSERT INTO ai_runs (id, feature, user_id, input_hash, output, model, latency_ms, status, accepted, created_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+// Endpoint 3: 30 Healthy deliveries
+const insertDelivery = sqlite.prepare(`
+  INSERT INTO webhook_deliveries (id, event_id, endpoint_id, workspace_id, attempt_number, request_headers, request_body, response_status, response_headers, response_body, duration_ms, error_type, status, scheduled_at, attempted_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
-insertAiRun.run(
-  "air_101",
-  "health_summary",
-  "usr_am_rohan",
-  "hash_meridian_summary",
-  JSON.stringify({
-    summary: "Meridian Finserv shows significant churn risk (-36% usage drop) and high credit ceiling risk (88% on SME credit). Recommended immediate AM escalation.",
-    confidence: 0.94,
-  }),
-  "gemini-2.5-flash",
-  840,
-  "success",
-  1,
-  nowSeconds - 2 * 86400
-);
-
-insertAiRun.run(
-  "air_102",
-  "churn_prediction",
-  "usr_am_priya",
-  "hash_churn_batch",
-  JSON.stringify({
-    highRiskOrgs: ["org_meridian_finserv", "org_kubermf", "org_swiftcargo", "org_gurukuled", "org_flyocean"],
-    avgDropPct: 34.2,
-  }),
-  "gemini-2.5-flash",
-  1250,
-  "success",
-  1,
-  nowSeconds - 1 * 86400
-);
-
-const insertTask = sqlite.prepare(`
-  INSERT INTO tasks (id, org_id, assigned_to, title, source, status, due_at)
+const insertEvent = sqlite.prepare(`
+  INSERT INTO webhook_events (id, workspace_id, endpoint_id, type, payload, created_at, api_version)
   VALUES (?, ?, ?, ?, ?, ?, ?)
 `);
 
-insertTask.run(
-  "tsk_101",
-  "org_meridian_finserv",
-  "usr_am_rohan",
-  "Conduct Quarterly Health Review with CFO regarding 36% volume drop",
-  "ai_recommendation",
-  "pending",
-  nowSeconds + 3 * 86400
-);
+for (let i = 1; i <= 30; i++) {
+  const evtTime = nowEpoch - 86400 * 2 + i * 3600;
+  const evtId = `whevt_healthy_${i}`;
+  const delId = `del_healthy_${i}`;
+  const payload = JSON.stringify({
+    event: "message.queued",
+    id: `msg_healthy_${i}`,
+    status: "queued",
+    seq: i,
+    timestamp: new Date(evtTime * 1000).toISOString()
+  });
 
-insertTask.run(
-  "tsk_102",
-  "org_meridian_finserv",
-  "usr_fin_vikram",
-  "Follow up on 38-day overdue invoice #INV-1001 (Rs. 4.85L)",
-  "manual",
-  "in_progress",
-  nowSeconds + 1 * 86400
-);
+  insertEvent.run(evtId, "ws_acmepay_prod", "wh_ep_acmepay_events", "message.queued", payload, evtTime, "v2025-10-01");
+  insertDelivery.run(
+    delId,
+    evtId,
+    "wh_ep_acmepay_events",
+    "ws_acmepay_prod",
+    1,
+    JSON.stringify({ "content-type": "application/json" }),
+    payload,
+    200,
+    JSON.stringify({ "content-type": "application/json" }),
+    JSON.stringify({ success: true, processed_seq: i }),
+    45 + (i % 25),
+    "none",
+    "success",
+    evtTime,
+    evtTime + 1
+  );
+}
 
-insertTask.run(
-  "tsk_103",
-  "org_zenithlogistics",
-  "usr_comp_suresh",
-  "Request corrected Certificate of Incorporation matching declared legal name",
-  "manual",
-  "pending",
-  nowSeconds + 2 * 86400
-);
+console.log("✅ Seeded Webhook Endpoints with 2 debuggable failure scenarios & 30 healthy deliveries.");
 
 // ---------------------------------------------------------------------------
-// 20. Approval Policies (Maker-Checker Rules Table)
+// 6. Seed Customer Profiles (15) and CDP Ingested Events (60)
 // ---------------------------------------------------------------------------
-const insertPolicy = sqlite.prepare(`
-  INSERT INTO approval_policies (
-    id, name, description, action_type, threshold_type, threshold_value, approver_role, is_active
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+const profileStmt = sqlite.prepare(`
+  INSERT INTO customers_profiles (id, workspace_id, environment, external_id, attributes, traits, events_count, created_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
-insertPolicy.run(
-  "pol_credit_limit_amount",
-  "Credit Limit Hike > ₹5,00,000",
-  "Any postpaid credit limit increase exceeding ₹5,00,000 requires Finance Head second-level review.",
-  "credit_limit_increase",
-  "amount",
-  500000,
-  "finance_head",
-  1
-);
-
-insertPolicy.run(
-  "pol_credit_limit_pct",
-  "Credit Limit Hike > 25%",
-  "Any credit limit increase exceeding 25% of the current active limit requires Finance Head approval.",
-  "credit_limit_increase",
-  "percentage",
-  25,
-  "finance_head",
-  1
-);
-
-insertPolicy.run(
-  "pol_credit_overdue_invoice",
-  "Credit Limit Hike with Overdue Invoices",
-  "Any credit limit increase for an organization with overdue invoices requires Finance Head sign-off, regardless of amount.",
-  "credit_limit_increase",
-  "condition",
-  0,
-  "finance_head",
-  1
-);
-
-insertPolicy.run(
-  "pol_wallet_adjustment",
-  "Manual Wallet Adjustment > ₹50,000",
-  "Manual credits or debits exceeding ₹50,000 to prevent internal ledger drift require Finance Head approval.",
-  "wallet_adjustment",
-  "amount",
-  50000,
-  "finance_head",
-  1
-);
-
-insertPolicy.run(
-  "pol_discount_pct",
-  "Discount > 15% or Sub-Floor Rates",
-  "Discounts exceeding 15% or custom per-message rate overrides below plan floor require Admin approval.",
-  "custom_discount",
-  "percentage",
-  15,
-  "admin",
-  1
-);
-
-insertPolicy.run(
-  "pol_suspension_postpaid_due",
-  "Postpaid Account Suspension with Outstanding Dues",
-  "Suspending a postpaid account with unpaid/overdue invoices requires Finance Head confirmation.",
-  "account_suspension",
-  "condition",
-  0,
-  "finance_head",
-  1
-);
-
-insertPolicy.run(
-  "pol_offboarding",
-  "Organization Offboarding & Data Deletion",
-  "Customer offboarding, contract termination, and workspace deletion always require Admin approval.",
-  "account_offboarding",
-  "boolean",
-  1,
-  "admin",
-  1
-);
-
-insertPolicy.run(
-  "pol_kyc_approval",
-  "KYC & DLT Sender-ID Verification",
-  "KYC records and TRAI DLT sender IDs require Compliance approval. The submitter cannot approve.",
-  "kyc_approval",
-  "condition",
-  0,
-  "compliance",
-  1
-);
-
-// ---------------------------------------------------------------------------
-// 19.5 Seed Proactive System & Risk Alerts
-// ---------------------------------------------------------------------------
-const insertAlert = sqlite.prepare(`
-  INSERT INTO alerts (id, workspace_id, org_id, type, severity, title, message, created_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+const eventStmt = sqlite.prepare(`
+  INSERT INTO events_ingested (id, workspace_id, environment, customer_id, event_name, properties, timestamp)
+  VALUES (?, ?, ?, ?, ?, ?, ?)
 `);
 
-insertAlert.run(
-  "alt_hero_meridian_util",
-  "ws_meridian_finserv_sme",
-  "org_meridian_finserv",
-  "credit_utilization_80",
-  "warning",
-  "Credit Warning: Meridian SME Credit crossed 88%",
-  "Workspace utilized ₹22,00,000 of ₹25,00,000 (88%). Dispatches will throttle at 100%. Consider proactive credit expansion.",
-  nowSeconds - 14400
-);
+const firstNames = ["Aarav", "Priya", "Rahul", "Ananya", "Rohan", "Sneha", "Vikram", "Neha", "Aditya", "Tanvi", "Karan", "Pooja", "Arjun", "Meera", "Kabir"];
+const cities = ["Bengaluru", "Mumbai", "Delhi-NCR", "Hyderabad", "Pune", "Chennai"];
 
-insertAlert.run(
-  "alt_hero_zippymart_lowbal",
-  "ws_zippymart_core",
-  "org_zippymart",
-  "prepaid_low_balance",
-  "warning",
-  "Low Wallet Runway: ZippyMart Hyperlocal",
-  "Prepaid balance is ₹105 (less than 1 day of cover based on 14-day EWMA burn of ₹18,450/day). Immediate top-up recommended.",
-  nowSeconds - 28800
-);
+for (let i = 0; i < 15; i++) {
+  const profId = `prf_acme_${1000 + i}`;
+  const extId = `cust_acmepay_${7700 + i}`;
+  const name = `${firstNames[i]} Sharma`;
+  const city = cities[i % cities.length];
+  const ltv = 2500 + i * 3800;
+  const createdAt = nowEpoch - 86400 * 5 + i * 1800;
 
-insertAlert.run(
-  "alt_hero_overdue_meridian",
-  "ws_meridian_finserv_sme",
-  "org_meridian_finserv",
-  "invoice_overdue_30",
-  "critical",
-  "Collections Alert: ₹4,76,594 Overdue for Meridian Finserv",
-  "Invoice inv_1003 is overdue by 12 days. High risk flag raised under collections protocol.",
-  nowSeconds - 86400
-);
+  const attributes = JSON.stringify({
+    name,
+    email: `${firstNames[i].toLowerCase()}.${7700 + i}@gmail.com`,
+    phone: `+9198765${String(10000 + i).slice(-5)}`,
+    city
+  });
+
+  const traits = JSON.stringify({
+    tier: i % 3 === 0 ? "platinum" : i % 2 === 0 ? "gold" : "silver",
+    lifetime_value_inr: ltv,
+    kyc_verified: i % 4 !== 0,
+    preferred_channel: i % 3 === 0 ? "whatsapp" : "sms"
+  });
+
+  profileStmt.run(profId, "ws_acmepay_prod", "test", extId, attributes, traits, 4, createdAt, nowEpoch - 600);
+
+  // Ingest 4 events per customer profile = 60 events total
+  const eventTypes = ["user_signup", "kyc_submitted", "order_placed", "payment_completed"];
+  for (let j = 0; j < 4; j++) {
+    const evtId = `evt_acme_${1000 + i}_${j}`;
+    const evtProps = JSON.stringify({
+      order_id: `ord_${10000 + i * 4 + j}`,
+      amount_inr: 499 + j * 750,
+      channel: j % 2 === 0 ? "UPI" : "NetBanking",
+      step: eventTypes[j]
+    });
+    const evtTime = createdAt + (j + 1) * 3600;
+    eventStmt.run(evtId, "ws_acmepay_prod", "test", profId, eventTypes[j], evtProps, evtTime);
+  }
+}
+
+console.log("✅ Seeded 15 Customer Profiles and 60 Ingested CDP Events.");
 
 // ---------------------------------------------------------------------------
-// 20. Print Rich Summary & Verify Hero Scenarios
+// 7. Seed Messages (40) Across SMS, RCS, WhatsApp and Various States
 // ---------------------------------------------------------------------------
-const countOrgs = (sqlite.prepare("SELECT COUNT(*) as c FROM organizations").get() as any).c;
-const countPrepaid = (sqlite.prepare("SELECT COUNT(*) as c FROM organizations WHERE billing_model = 'prepaid'").get() as any).c;
-const countPostpaid = (sqlite.prepare("SELECT COUNT(*) as c FROM organizations WHERE billing_model = 'postpaid'").get() as any).c;
-const countWorkspaces = (sqlite.prepare("SELECT COUNT(*) as c FROM workspaces").get() as any).c;
-const countUsers = (sqlite.prepare("SELECT COUNT(*) as c FROM workspace_users").get() as any).c;
-const countUsageRows = (sqlite.prepare("SELECT COUNT(*) as c FROM usage_daily").get() as any).c;
-const countInvoices = (sqlite.prepare("SELECT COUNT(*) as c FROM invoices").get() as any).c;
-const countOverdueInv = (sqlite.prepare("SELECT COUNT(*) as c FROM invoices WHERE status = 'overdue'").get() as any).c;
-const countDisputedInv = (sqlite.prepare("SELECT COUNT(*) as c FROM invoices WHERE status = 'disputed'").get() as any).c;
-const countTickets = (sqlite.prepare("SELECT COUNT(*) as c FROM tickets").get() as any).c;
-const countKyc = (sqlite.prepare("SELECT COUNT(*) as c FROM kyc_cases").get() as any).c;
-const countSenderIds = (sqlite.prepare("SELECT COUNT(*) as c FROM sender_ids").get() as any).c;
-const countTemplates = (sqlite.prepare("SELECT COUNT(*) as c FROM templates").get() as any).c;
-const countChangeRequests = (sqlite.prepare("SELECT COUNT(*) as c FROM change_requests WHERE status = 'pending'").get() as any).c;
-const countAuditLogs = (sqlite.prepare("SELECT COUNT(*) as c FROM audit_log").get() as any).c;
+const messageStmt = sqlite.prepare(`
+  INSERT INTO messages (id, workspace_id, environment, channel, "to", recipient, sender_id, template_id, body, status, failure_reason, created_at, updated_at, delivered_at, external_ref, cost_would_be, cost)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const channels = ["sms", "rcs", "whatsapp"] as const;
+const msgStatuses = ["delivered", "delivered", "delivered", "read", "queued", "failed"] as const;
+
+for (let i = 1; i <= 40; i++) {
+  const msgId = `msg_acme_${String(i).padStart(4, "0")}`;
+  const ch = channels[i % channels.length];
+  const st = msgStatuses[i % msgStatuses.length];
+  const phone = `+9198765${String(20000 + i).slice(-5)}`;
+  const cost = ch === "whatsapp" ? 0.35 : ch === "rcs" ? 0.20 : 0.12;
+  const msgTime = nowEpoch - 86400 * 3 + i * 6200;
+  const isFailed = st === "failed";
+  const failureReason = isFailed ? "TRAI DLT Template Variable length exceeded limit" : null;
+
+  messageStmt.run(
+    msgId,
+    "ws_acmepay_prod",
+    "test",
+    ch,
+    phone,
+    phone,
+    "ACMEPY",
+    "dlt_tmpl_otp_login",
+    `AcmePay: Your verification code is ${100000 + (i * 73) % 900000}. Valid for 10 mins.`,
+    st,
+    failureReason,
+    msgTime,
+    msgTime + 1,
+    st === "delivered" || st === "read" ? msgTime + 1 : null,
+    `ref_order_${9000 + i}`,
+    cost,
+    0
+  );
+}
+
+console.log("✅ Seeded 40 Messages in various states (queued, delivered, failed, read).");
+
+// ---------------------------------------------------------------------------
+// 8. Seed API Requests (~200 requests spanning 3 days with realistic mix of HTTP codes)
+// ---------------------------------------------------------------------------
+const requestStmt = sqlite.prepare(`
+  INSERT INTO api_requests (id, workspace_id, key_id, environment, method, path, status, duration_ms, request_headers, request_body, response_body, idempotency_key, error_code, request_id, billed_amount_would_be, billed_amount_actual, created_at, api_version, ip)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const paths = [
+  "/v1/messages",
+  "/v1/messages",
+  "/v1/messages",
+  "/v1/messages/msg_acme_0012",
+  "/v1/events",
+  "/v1/events",
+  "/v1/profiles/cust_acmepay_7701",
+  "/v1/channels"
+];
+
+for (let i = 1; i <= 200; i++) {
+  const reqId = `req_01JB_${String(i).padStart(5, "0")}`;
+  const reqTime = nowEpoch - 86400 * 3 + Math.floor((i / 200) * 86400 * 3);
+  const path = paths[i % paths.length];
+  const method = path.startsWith("/v1/messages/") || path.startsWith("/v1/profiles/") || path === "/v1/channels" ? "GET" : "POST";
+
+  // Distribution: ~70% 200/202, ~8% 400, ~5% 401, ~9% 422, ~6% 429, ~2% 500
+  let status = 200;
+  let errorCode: string | null = null;
+  let durationMs = 28 + (i % 60);
+
+  if (i % 50 === 0) {
+    status = 500;
+    errorCode = "ERR_UPSTREAM_CARRIER_TIMEOUT";
+    durationMs = 2800;
+  } else if (i % 25 === 0) {
+    status = 429;
+    errorCode = "ERR_RATE_LIMIT_EXCEEDED";
+    durationMs = 12;
+  } else if (i % 15 === 0) {
+    status = 422;
+    errorCode = "ERR_DLT_TEMPLATE_MISMATCH";
+    durationMs = 35;
+  } else if (i % 18 === 0) {
+    status = 401;
+    errorCode = "ERR_INVALID_API_KEY";
+    durationMs = 15;
+  } else if (i % 12 === 0) {
+    status = 400;
+    errorCode = "ERR_MALFORMED_RECIPIENT";
+    durationMs = 22;
+  } else if (method === "POST" && path === "/v1/messages") {
+    status = 202; // Queued
+  }
+
+  const reqBody = method === "POST"
+    ? JSON.stringify({
+        channel: "sms",
+        recipient: "+919876543210",
+        template_id: "dlt_tmpl_otp_login",
+        body: `AcmePay OTP: ${100000 + i}. Do not share.`
+      })
+    : null;
+
+  const respBody = status < 400
+    ? JSON.stringify({ id: `msg_gen_${i}`, status: status === 202 ? "queued" : "delivered" })
+    : JSON.stringify({ error: { code: errorCode, message: `Request failed with ${errorCode}` } });
+
+  requestStmt.run(
+    reqId,
+    "ws_acmepay_prod",
+    "key_test_acmepay_default",
+    "test",
+    method,
+    path,
+    status,
+    durationMs,
+    JSON.stringify({ "authorization": "Bearer rk_test_...", "content-type": "application/json" }),
+    reqBody,
+    respBody,
+    `idem_key_${100000 + i}`,
+    errorCode,
+    `req_trace_${i}`,
+    0.12,
+    0,
+    reqTime,
+    "v2025-10-01",
+    `49.205.${10 + (i % 80)}.${1 + (i % 250)}`
+  );
+}
+
+console.log("✅ Seeded 200 API Requests spanning 3 days with realistic mix of HTTP 200, 202, 400, 401, 422, 429, 500.");
+
+// ---------------------------------------------------------------------------
+// 9. Seed Changelog Entries (14 Entries Across 3 API Versions with Breaking & Sunset Dates)
+// ---------------------------------------------------------------------------
+const changelogStmt = sqlite.prepare(`
+  INSERT INTO changelog_entries (id, version, date, type, title, body, affected_endpoints, breaking, sunset_date)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const changelogData = [
+  // v2025-10-01 (Current GA)
+  {
+    id: "cle_2025_10_01",
+    version: "v2025-10-01",
+    date: "2026-10-28",
+    type: "added",
+    title: "Real-time Customer Data Platform (CDP) Profile Ingestion",
+    body: "Introduced POST /v1/events and GET /v1/profiles/:id for real-time customer event streaming and automated trait calculations.",
+    affectedEndpoints: JSON.stringify(["POST /v1/events", "GET /v1/profiles/:id"]),
+    breaking: 0,
+    sunsetDate: null
+  },
+  {
+    id: "cle_2025_10_02",
+    version: "v2025-10-01",
+    date: "2026-10-20",
+    type: "added",
+    title: "Meta WhatsApp Cloud API Channel Integration",
+    body: "Native support for WhatsApp Business OTP templates and rich media interactive catalogs via POST /v1/messages.",
+    affectedEndpoints: JSON.stringify(["POST /v1/messages"]),
+    breaking: 0,
+    sunsetDate: null
+  },
+  {
+    id: "cle_2025_10_03",
+    version: "v2025-10-01",
+    date: "2026-10-15",
+    type: "changed",
+    title: "Increased Sandbox Rate Limits to 50 TPS",
+    body: "Default rate limit for evaluation workspaces increased from 25 to 50 transactions per second.",
+    affectedEndpoints: JSON.stringify(["*"]),
+    breaking: 0,
+    sunsetDate: null
+  },
+  {
+    id: "cle_2025_10_04",
+    version: "v2025-10-01",
+    date: "2026-10-05",
+    type: "security",
+    title: "Mandatory HMAC-SHA256 Webhook Signatures",
+    body: "All outbound delivery webhooks now require validation using the X-Relay-Signature header with timestamp drift tolerance of 5 minutes.",
+    affectedEndpoints: JSON.stringify(["Webhook Delivery Engine"]),
+    breaking: 1, // Breaking change 1
+    sunsetDate: null
+  },
+  {
+    id: "cle_2025_10_05",
+    version: "v2025-10-01",
+    date: "2026-09-28",
+    type: "fixed",
+    title: "Fixed Airtel DLR Latency Spikes in North Circles",
+    body: "Resolved internal queue buffering that caused handset delivery receipts to lag during Diwali high-traffic bursts.",
+    affectedEndpoints: JSON.stringify(["POST /v1/messages"]),
+    breaking: 0,
+    sunsetDate: null
+  },
+
+  // v2025-01-15 (Supported)
+  {
+    id: "cle_2025_01_01",
+    version: "v2025-01-15",
+    date: "2025-06-12",
+    type: "added",
+    title: "Google Jibe RCS Rich Messaging Support",
+    body: "Added support for rich cards, suggestion action chips, and automated fallback to SMS when data connection is unavailable.",
+    affectedEndpoints: JSON.stringify(["POST /v1/messages"]),
+    breaking: 0,
+    sunsetDate: null
+  },
+  {
+    id: "cle_2025_01_02",
+    version: "v2025-01-15",
+    date: "2025-04-18",
+    type: "changed",
+    title: "Strict E.164 Validation for Indian Mobile Numbers",
+    body: "Recipient numbers must include +91 prefix and exactly 10 valid mobile digits.",
+    affectedEndpoints: JSON.stringify(["POST /v1/messages"]),
+    breaking: 1, // Breaking change 2
+    sunsetDate: null
+  },
+  {
+    id: "cle_2025_01_03",
+    version: "v2025-01-15",
+    date: "2025-03-02",
+    type: "fixed",
+    title: "Corrected Timezone Serialization to IST (Asia/Kolkata)",
+    body: "All delivery timestamps now strictly adhere to ISO 8601 UTC with optional IST conversion headers.",
+    affectedEndpoints: JSON.stringify(["GET /v1/messages/:id"]),
+    breaking: 0,
+    sunsetDate: null
+  },
+  {
+    id: "cle_2025_01_04",
+    version: "v2025-01-15",
+    date: "2025-01-15",
+    type: "deprecated",
+    title: "Deprecation Notice: Legacy XML Delivery Reports",
+    body: "XML delivery callbacks are deprecated in favor of JSON webhooks and will be shut down on June 1, 2027.",
+    affectedEndpoints: JSON.stringify(["/v1/reports/dlr.xml"]),
+    breaking: 0,
+    sunsetDate: "2027-06-01" // Deprecation 1 with sunset
+  },
+
+  // v2024-06-01 (Deprecated)
+  {
+    id: "cle_2024_06_01",
+    version: "v2024-06-01",
+    date: "2024-11-20",
+    type: "deprecated",
+    title: "Deprecation of Basic Auth in favor of Bearer Token Keys",
+    body: "HTTP Basic Authentication using account credentials has been marked deprecated. Please migrate to Bearer rk_... tokens.",
+    affectedEndpoints: JSON.stringify(["*"]),
+    breaking: 0,
+    sunsetDate: "2027-06-01" // Deprecation 2 with sunset
+  },
+  {
+    id: "cle_2024_06_02",
+    version: "v2024-06-01",
+    date: "2024-09-14",
+    type: "removed",
+    title: "Removed Unsigned Webhook Payload Support",
+    body: "Unsigned webhooks without HMAC verification headers have been decommissioned across all customer endpoints.",
+    affectedEndpoints: JSON.stringify(["Webhooks"]),
+    breaking: 0,
+    sunsetDate: "2025-01-01"
+  },
+  {
+    id: "cle_2024_06_03",
+    version: "v2024-06-01",
+    date: "2024-07-02",
+    type: "changed",
+    title: "Consolidated Error Payloads to RFC 7807 Format",
+    body: "Standardized error code response objects across all gateway services.",
+    affectedEndpoints: JSON.stringify(["*"]),
+    breaking: 0,
+    sunsetDate: null
+  },
+  {
+    id: "cle_2024_06_04",
+    version: "v2024-06-01",
+    date: "2024-06-01",
+    type: "added",
+    title: "Initial Launch of Relay Developer API v2024-06-01",
+    body: "First GA release with High-throughput Indian SMS and TRAI DLT verification engine.",
+    affectedEndpoints: JSON.stringify(["POST /v1/messages", "GET /v1/messages/:id"]),
+    breaking: 0,
+    sunsetDate: "2027-06-01"
+  }
+];
+
+for (const entry of changelogData) {
+  changelogStmt.run(
+    entry.id,
+    entry.version,
+    entry.date,
+    entry.type,
+    entry.title,
+    entry.body,
+    entry.affectedEndpoints,
+    entry.breaking,
+    entry.sunsetDate
+  );
+}
+
+console.log("✅ Seeded 13 Changelog entries across 3 API versions with breaking changes and sunset dates.");
+
+// ---------------------------------------------------------------------------
+// 9b. Seed Incidents, Known Issues & Support Threads
+// ---------------------------------------------------------------------------
+sqlite.exec(`
+  INSERT INTO incidents (id, title, status, impact, affected_components, updates, created_at, resolved_at) VALUES
+  (
+    'inc_airtel_dlr_01',
+    'Degraded Airtel Handset DLR Delivery in North Circles',
+    'resolved',
+    'minor',
+    '["Bharti Airtel SMPP Link", "SMS Delivery Reports"]',
+    '[{"timestamp": "2026-10-28T14:30:00Z", "status": "resolved", "body": "Upstream queue buffering cleared by Bharti Airtel NOC. DLR latencies normalized to < 1.2s."}, {"timestamp": "2026-10-28T12:00:00Z", "status": "identified", "body": "Identified high latency on Airtel SMSC in Delhi-NCR and Punjab telecom circles."}]',
+    ${nowEpoch - 86400 * 2},
+    ${nowEpoch - 86400 * 2 + 7200}
+  ),
+  (
+    'inc_jio_maintenance_01',
+    'Scheduled Jio SMPP Gateway Route Maintenance',
+    'resolved',
+    'none',
+    '["Reliance Jio SMPP Link"]',
+    '[{"timestamp": "2026-10-25T03:30:00Z", "status": "resolved", "body": "Maintenance completed without message loss. Traffic routed seamlessly via redundant link."}, {"timestamp": "2026-10-25T02:00:00Z", "status": "monitoring", "body": "Secondary carrier links actively taking live traffic."}]',
+    ${nowEpoch - 86400 * 5},
+    ${nowEpoch - 86400 * 5 + 5400}
+  );
+
+  INSERT INTO known_issues (id, title, component, status, description, workaround, created_at) VALUES
+  (
+    'iss_wa_weekend_approval',
+    'Meta WhatsApp Business Template Review Delays on Weekends',
+    'WhatsApp Cloud API',
+    'workaround_available',
+    'Meta template reviewers operate on reduced weekend capacity, causing automated template status checks to take up to 24 hours.',
+    'Submit WhatsApp OTP and marketing templates between 9:00 AM and 6:00 PM IST on weekdays for approval within 15 minutes.',
+    ${nowEpoch - 86400 * 10}
+  ),
+  (
+    'iss_node_undici_keepalive',
+    'Node.js 18+ undici connection reset during long-lived webhook listener',
+    'Webhooks & SDKs',
+    'workaround_available',
+    'Default undici HTTP client in Node 18 closes idle keep-alive sockets abruptly after 5 seconds of inactivity.',
+    'Configure custom http.Agent with keepAlive: true, keepAliveMsecs: 30000, and maxSockets: 50 when consuming high-volume webhooks.',
+    ${nowEpoch - 86400 * 7}
+  ),
+  (
+    'iss_dlt_telco_sync_lag',
+    'TRAI DLT Entity & Header Registration Propagation Latency',
+    'DLT Verification Engine',
+    'workaround_available',
+    'New Sender IDs registered on Vodafone Idea (Vi) portal take up to 24 hours to sync to Airtel and Jio registry databases.',
+    'Register sender IDs through Vilpower or PingConnect first, which broadcast changes across all Indian operators within 4 hours.',
+    ${nowEpoch - 86400 * 14}
+  );
+
+  INSERT INTO support_threads (id, workspace_id, subject, status, context, created_at, messages) VALUES
+  (
+    'thr_acme_dlt_query',
+    'ws_acmepay_prod',
+    'Query regarding DLT Principal Entity ID binding for OTP templates',
+    'resolved',
+    '{"environment":"test","apiVersion":"v2025-10-01","sdkLanguage":"node","last10RequestIds":["req_seed_test_01","req_seed_test_02"]}',
+    ${nowEpoch - 86400},
+    '[{"id":"msg_sub_01","sender":"developer","authorName":"Aditya Roy","text":"Hi Relay Team, in test mode do we need to provide our real MCA DLT Principal Entity ID to send OTPs, or is that mocked?","timestamp":"2026-10-29T10:00:00Z"},{"id":"msg_sub_02","sender":"engineer","authorName":"Priya Sharma (Relay Solutions)","text":"Hi Aditya! Great question. In Test mode, Relay automatically bypasses live carrier DLT matching and provides pre-approved templates (like dlt_tmpl_otp_login). You do not need an MCA certificate or TRAI DLT account until you transition to Live mode.","timestamp":"2026-10-29T10:15:00Z"}]'
+  );
+`);
+
+console.log("✅ Seeded System Incidents, Known Issues, and initial Support Thread.");
+
+// ---------------------------------------------------------------------------
+// 10. Summary Verification
+// ---------------------------------------------------------------------------
+function getCount(tableName: string): number {
+  const row: any = sqlite.prepare(`SELECT count(*) as count FROM ${tableName}`).get();
+  return row.count;
+}
 
 console.log("\n==========================================================================");
-console.log("                  RELAY BMP DATABASE SEED SUMMARY                         ");
+console.log("             RELAY DEVELOPER HUB DATABASE SEED SUMMARY                    ");
 console.log("==========================================================================");
-console.log(`🏢 Organizations total:         ${countOrgs} (Prepaid: ${countPrepaid}, Postpaid: ${countPostpaid})`);
-console.log(`🌐 Workspaces total:            ${countWorkspaces}`);
-console.log(`👥 Workspace Users total:       ${countUsers}`);
-console.log(`📈 90-Day Usage Daily rows:     ${countUsageRows}`);
-console.log(`🧾 Invoices total:              ${countInvoices} (Overdue: ${countOverdueInv}, Disputed: ${countDisputedInv})`);
-console.log(`🎫 Support Tickets:             ${countTickets}`);
-console.log(`📋 KYC Cases:                   ${countKyc}`);
-console.log(`✉️  Sender IDs:                  ${countSenderIds}`);
-console.log(`📝 Templates:                   ${countTemplates}`);
-console.log(`⚖️  Pending Change Requests:     ${countChangeRequests}`);
-console.log(`📜 Audit Log entries:           ${countAuditLogs}`);
-console.log("==========================================================================\n");
+console.log("👤 Users total:                 ", getCount("users"));
+console.log("🏢 Organizations total:         ", getCount("organizations"));
+console.log("🌐 Workspaces total:            ", getCount("workspaces"));
+console.log("🔑 API Keys total:              ", getCount("api_keys"));
+console.log("📡 Webhook Endpoints total:     ", getCount("webhook_endpoints"));
+console.log("📨 Webhook Events total:        ", getCount("webhook_events"));
+console.log("🚀 Webhook Deliveries total:    ", getCount("webhook_deliveries"));
+console.log("📊 API Requests (3 Days):       ", getCount("api_requests"));
+console.log("💬 Messages total:              ", getCount("messages"));
+console.log("👥 Customer Profiles (CDP):     ", getCount("customers_profiles"));
+console.log("⚡ Ingested CDP Events:         ", getCount("events_ingested"));
+console.log("📜 Changelog Entries:           ", getCount("changelog_entries"));
+console.log("🏷️  API Versions:                ", getCount("api_versions"));
+console.log("==========================================================================");
+console.log("✅ Seed completed successfully!\n");
 
-// Verify Hero Scenarios
-console.log("🔍 Verifying Hero Scenarios:");
-const hero = sqlite.prepare("SELECT * FROM organizations WHERE id = 'org_meridian_finserv'").get() as any;
-const heroWs = sqlite.prepare("SELECT * FROM workspaces WHERE org_id = 'org_meridian_finserv'").all() as any[];
-const heroOverdue = sqlite.prepare("SELECT * FROM invoices WHERE workspace_id IN (SELECT id FROM workspaces WHERE org_id = 'org_meridian_finserv') AND status = 'overdue'").all() as any[];
-const heroSender = sqlite.prepare("SELECT * FROM sender_ids WHERE workspace_id IN (SELECT id FROM workspaces WHERE org_id = 'org_meridian_finserv') AND header = 'MRDFIN'").get() as any;
-const smeWs = heroWs.find((w: any) => w.id.includes("sme"));
-
-console.log(`  ✓ Hero Organization: '${hero.name}' (${hero.legal_name})`);
-console.log(`  ✓ Workspaces count: ${heroWs.length}`);
-console.log(`  ✓ SME Workspace Credit Used: ₹${smeWs.credit_used.toLocaleString("en-IN")} / ₹${smeWs.credit_limit.toLocaleString("en-IN")} (${Math.round((smeWs.credit_used / smeWs.credit_limit) * 100)}% utilization)`);
-console.log(`  ✓ Hero Overdue Invoices: ${heroOverdue.length} (${heroOverdue[0]?.id}, Period: ${heroOverdue[0]?.period})`);
-console.log(`  ✓ Hero Breached Sender ID: ${heroSender?.header} (${heroSender?.status}, submitted ${Math.round((nowSeconds - heroSender?.submitted_at) / 86400)} days ago)`);
-
-sqlite.close();
-console.log("\n✅ Relay BMP Database seeded and verified successfully!");
+// Automatically index docs chunks so doc_chunks table is always populated
+import { indexDocs } from "../../scripts/index-docs";
+indexDocs().catch(() => {});

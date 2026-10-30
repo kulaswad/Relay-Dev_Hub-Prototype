@@ -20,7 +20,7 @@ export interface AIActivityClientProps {
   runs: Array<{
     id: string;
     feature: string;
-    userId: string;
+    userId: string | null;
     inputHash: string;
     output: string;
     model: string;

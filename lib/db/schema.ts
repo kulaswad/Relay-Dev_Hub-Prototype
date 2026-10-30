@@ -47,7 +47,7 @@ export const organizations = sqliteTable(
   {
     id: text("id").primaryKey(), // e.g. "org_meridian_finserv"
     name: text("name").notNull(),
-    legalName: text("legal_name").notNull(),
+    legalName: text("legal_name").notNull().default(""),
     slug: text("slug").notNull().unique(),
     industry: text("industry", {
       enum: [
@@ -59,11 +59,13 @@ export const organizations = sqliteTable(
         "Healthcare",
         "Travel",
         "Logistics",
+        "Other",
       ],
-    }).notNull(),
-    city: text("city").notNull(),
+    }).notNull().default("Fintech"),
+    city: text("city").notNull().default("Bengaluru"),
     ownerAmId: text("owner_am_id")
       .notNull()
+      .default("usr_priya_sharma")
       .references(() => internalUsers.id),
     status: text("status", {
       enum: ["onboarding", "active", "at_risk", "suspended", "offboarded"],
@@ -71,6 +73,7 @@ export const organizations = sqliteTable(
     billingModel: text("billing_model", { enum: ["prepaid", "postpaid"] }).notNull().default("prepaid"),
     planId: text("plan_id")
       .notNull()
+      .default("plan_starter")
       .references(() => plans.id),
     contractStart: integer("contract_start", { mode: "timestamp" }),
     contractEnd: integer("contract_end", { mode: "timestamp" }),
@@ -95,22 +98,37 @@ export const workspaces = sqliteTable(
     orgId: text("org_id")
       .notNull()
       .references(() => organizations.id, { onDelete: "cascade" }),
+    organizationId: text("organization_id"),
     name: text("name").notNull(),
     slug: text("slug").notNull(),
     status: text("status", {
       enum: ["kyc_pending", "kyc_in_review", "active", "suspended"],
     }).notNull().default("active"),
-    gstin: text("gstin").notNull(), // Valid Indian GSTIN format
-    billingState: text("billing_state").notNull(), // Indian State
+    kycStatus: text("kyc_status", {
+      enum: ["not_started", "in_review", "approved"],
+    }).notNull().default("not_started"),
+    senderIds: text("sender_ids").notNull().default("[]"), // JSON array
+    planTier: text("plan_tier", {
+      enum: ["sandbox", "growth", "enterprise"],
+    }).notNull().default("sandbox"),
+    rateLimitPerMin: integer("rate_limit_per_min").notNull().default(60),
+    monthlyQuota: integer("monthly_quota").notNull().default(10000),
     walletBalance: real("wallet_balance").notNull().default(0), // for prepaid
+    isAnonymous: integer("is_anonymous", { mode: "boolean" }).notNull().default(false),
+    expiresAt: integer("expires_at", { mode: "timestamp" }),
+    gstin: text("gstin").notNull().default("29ABCDE1234F1Z5"), // Valid Indian GSTIN format
+    billingState: text("billing_state").notNull().default("Karnataka"), // Indian State
     creditLimit: real("credit_limit").notNull().default(0), // for postpaid
     creditUsed: real("credit_used").notNull().default(0), // for postpaid
+    receiverBehavior: text("receiver_behavior").notNull().default("200"), // "200" | "500" | "401" | "timeout" | "verify_signature"
+    accelerationFactor: integer("acceleration_factor").notNull().default(1), // 1 = normal, 12 = 1min -> 5sec
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
     updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
   },
   (table) => ({
     orgIdIdx: index("ws_org_id_idx").on(table.orgId),
     statusIdx: index("ws_status_idx").on(table.status),
+    kycStatusIdx: index("ws_kyc_status_idx").on(table.kycStatus),
   })
 );
 
@@ -442,12 +460,9 @@ export const aiRuns = sqliteTable(
   "ai_runs",
   {
     id: text("id").primaryKey(),
-    feature: text("feature", {
-      enum: ["health_summary", "churn_prediction", "credit_forecast", "kyc_extraction"],
-    }).notNull(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => internalUsers.id),
+    feature: text("feature").notNull(), // "ask_docs", "generate_code", "explain_webhook", "health_summary", etc.
+    userId: text("user_id"),
+    workspaceId: text("workspace_id"),
     inputHash: text("input_hash").notNull(),
     output: text("output").notNull(), // JSON response string
     model: text("model").notNull(),
@@ -532,6 +547,508 @@ export const alerts = sqliteTable(
   })
 );
 
+// ---------------------------------------------------------------------------
+// 22. Users (Customer developer portal accounts)
+// ---------------------------------------------------------------------------
+export const users = sqliteTable(
+  "users",
+  {
+    id: text("id").primaryKey(), // e.g. "usr_..."
+    name: text("name").notNull(),
+    email: text("email").notNull().unique(),
+    passwordHash: text("password_hash").notNull(),
+    company: text("company").notNull(),
+    role: text("role", {
+      enum: ["Backend dev", "Mobile dev", "Data/CDP", "Other"],
+    }).notNull().default("Backend dev"),
+    intent: text("intent", {
+      enum: ["Evaluating Relay", "Already a Relay customer"],
+    }).notNull().default("Evaluating Relay"),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+  },
+  (table) => ({
+    emailIdx: index("users_email_idx").on(table.email),
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 23. Sessions (Signed HTTP-only auth & evaluation tokens)
+// ---------------------------------------------------------------------------
+export const sessions = sqliteTable(
+  "sessions",
+  {
+    id: text("id").primaryKey(), // Session token or uuid
+    userId: text("user_id").references(() => users.id, { onDelete: "cascade" }),
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    isAnonymous: integer("is_anonymous", { mode: "boolean" }).notNull().default(false),
+    expiresAt: integer("expires_at", { mode: "timestamp" }).notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+  },
+  (table) => ({
+    userIdIdx: index("sessions_user_idx").on(table.userId),
+    wsIdIdx: index("sessions_ws_idx").on(table.workspaceId),
+    expiresIdx: index("sessions_expires_idx").on(table.expiresAt),
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 24. API Keys (Developer Hub credentials with scopes, rotation & lock)
+// ---------------------------------------------------------------------------
+export const apiKeys = sqliteTable(
+  "api_keys",
+  {
+    id: text("id").primaryKey(), // e.g. "key_test_..." or "key_live_..."
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    prefix: text("prefix").notNull(), // "rk_test_" or "rk_live_"
+    hashedSecret: text("hashed_secret").notNull(),
+    secretMasked: text("secret_masked").notNull(), // "rk_test_••••••••9a2f"
+    fullKeyForDev: text("full_key_for_dev").notNull(), // For dev portal display & copy
+    environment: text("environment", { enum: ["test", "live"] }).notNull().default("test"),
+    scopes: text("scopes").notNull().default('["messages:send","events:write","profiles:read"]'), // JSON
+    status: text("status", { enum: ["active", "revoked", "rotating"] }).notNull().default("active"),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+    lastUsedAt: integer("last_used_at", { mode: "timestamp" }),
+    expiresAt: integer("expires_at", { mode: "timestamp" }),
+    rotatedFromId: text("rotated_from_id"),
+    gracePeriodEndsAt: integer("grace_period_ends_at", { mode: "timestamp" }),
+    ipAllowlist: text("ip_allowlist"), // Comma-separated list of allowed CIDRs/IPs
+    createdBy: text("created_by"),
+  },
+  (table) => ({
+    wsKeyIdx: index("ak_ws_idx").on(table.workspaceId),
+    envIdx: index("ak_env_idx").on(table.environment),
+    statusIdx: index("ak_status_idx").on(table.status),
+  })
+);
+
+export const apiKeyAuditLogs = sqliteTable(
+  "api_key_audit_logs",
+  {
+    id: text("id").primaryKey(), // "akal_..."
+    keyId: text("key_id").notNull(),
+    workspaceId: text("workspace_id").notNull(),
+    action: text("action").notNull(), // 'created' | 'rotated' | 'revoked' | 'scope_changed' | 'grace_period_ended'
+    actor: text("actor").notNull().default("developer"),
+    details: text("details"), // JSON payload with diffs/metadata
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+  },
+  (table) => ({
+    keyIdx: index("akal_key_idx").on(table.keyId),
+    wsIdx: index("akal_ws_idx").on(table.workspaceId),
+    createdIdx: index("akal_created_idx").on(table.createdAt),
+  })
+);
+
+export type ApiKeyAuditLog = typeof apiKeyAuditLogs.$inferSelect;
+export type NewApiKeyAuditLog = typeof apiKeyAuditLogs.$inferInsert;
+
+// ---------------------------------------------------------------------------
+// 25. Webhook Endpoints
+// ---------------------------------------------------------------------------
+export const webhookEndpoints = sqliteTable(
+  "webhook_endpoints",
+  {
+    id: text("id").primaryKey(), // e.g. "wh_..."
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    url: text("url").notNull(),
+    environment: text("environment", { enum: ["test", "live"] }).notNull().default("test"),
+    events: text("events").notNull().default('["message.delivered","message.failed"]'), // JSON array
+    signingSecret: text("signing_secret").notNull(), // "whsec_..."
+    previousSigningSecret: text("previous_signing_secret"), // For secret rotation dual-signing
+    secretRotationEndsAt: integer("secret_rotation_ends_at", { mode: "timestamp" }),
+    status: text("status", { enum: ["active", "disabled", "failing"] }).notNull().default("active"),
+    apiVersion: text("api_version").notNull().default("v2025-10-01"),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+    consecutiveFailures: integer("consecutive_failures").notNull().default(0),
+  },
+  (table) => ({
+    wsWhIdx: index("whe_ws_idx").on(table.workspaceId),
+    envWhIdx: index("whe_env_idx").on(table.environment),
+    statusIdx: index("whe_status_idx").on(table.status),
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 26. Webhook Events
+// ---------------------------------------------------------------------------
+export const webhookEvents = sqliteTable(
+  "webhook_events",
+  {
+    id: text("id").primaryKey(), // e.g. "whevt_..."
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    endpointId: text("endpoint_id")
+      .notNull()
+      .references(() => webhookEndpoints.id, { onDelete: "cascade" }),
+    type: text("type").notNull(), // e.g. "message.delivered", "customer.profile.updated"
+    payload: text("payload").notNull(), // JSON
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+    apiVersion: text("api_version").notNull().default("v2025-10-01"),
+  },
+  (table) => ({
+    wsEvtIdx: index("whevt_ws_idx").on(table.workspaceId),
+    epEvtIdx: index("whevt_ep_idx").on(table.endpointId),
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 27. Webhook Deliveries (With attempts, raw headers, payload & error types)
+// ---------------------------------------------------------------------------
+export const webhookDeliveries = sqliteTable(
+  "webhook_deliveries",
+  {
+    id: text("id").primaryKey(), // e.g. "del_..."
+    eventId: text("event_id")
+      .notNull()
+      .references(() => webhookEvents.id, { onDelete: "cascade" }),
+    endpointId: text("endpoint_id")
+      .notNull()
+      .references(() => webhookEndpoints.id, { onDelete: "cascade" }),
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    attemptNumber: integer("attempt_number").notNull().default(1),
+    requestHeaders: text("request_headers").notNull().default("{}"), // JSON
+    requestBody: text("request_body").notNull(),
+    responseStatus: integer("response_status"),
+    responseHeaders: text("response_headers"), // JSON
+    responseBody: text("response_body"),
+    durationMs: integer("duration_ms").notNull().default(100),
+    errorType: text("error_type", {
+      enum: [
+        "none",
+        "timeout",
+        "connection_refused",
+        "http_5xx",
+        "http_4xx",
+        "signature_rejected",
+        "ssl_error",
+      ],
+    }).notNull().default("none"),
+    status: text("status", {
+      enum: ["success", "failed", "retrying", "abandoned"],
+    }).notNull().default("success"),
+    scheduledAt: integer("scheduled_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+    attemptedAt: integer("attempted_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+    nextRetryAt: integer("next_retry_at", { mode: "timestamp" }),
+    replayOfId: text("replay_of_id"),
+  },
+  (table) => ({
+    evtDeliveryIdx: index("whd_evt_idx").on(table.eventId),
+    endpointDeliveryIdx: index("whd_ep_idx").on(table.endpointId),
+    statusDeliveryIdx: index("whd_status_idx").on(table.status),
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 28. API Requests (Real API request ledger with idempotency & billing)
+// ---------------------------------------------------------------------------
+export const apiRequests = sqliteTable(
+  "api_requests",
+  {
+    id: text("id").primaryKey(), // e.g. "req_..."
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    keyId: text("key_id"),
+    environment: text("environment", { enum: ["test", "live"] }).notNull().default("test"),
+    method: text("method").notNull(), // GET, POST, PUT, DELETE
+    path: text("path").notNull(), // e.g. "/v1/messages"
+    status: integer("status").notNull(), // 200, 202, 400, 401, 422, 429, 500
+    durationMs: integer("duration_ms").notNull().default(45),
+    requestHeaders: text("request_headers"), // JSON
+    requestBody: text("request_body"),
+    responseBody: text("response_body"),
+    idempotencyKey: text("idempotency_key"),
+    errorCode: text("error_code"),
+    requestId: text("request_id").notNull(),
+    billedAmountWouldBe: real("billed_amount_would_be").notNull().default(0),
+    billedAmountActual: real("billed_amount_actual").notNull().default(0),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+    apiVersion: text("api_version").notNull().default("v2025-10-01"),
+    ip: text("ip").notNull().default("127.0.0.1"),
+  },
+  (table) => ({
+    wsReqIdx: index("ar_ws_idx").on(table.workspaceId),
+    envReqIdx: index("ar_env_idx").on(table.environment),
+    statusReqIdx: index("ar_status_idx").on(table.status),
+    createdReqIdx: index("ar_created_idx").on(table.createdAt),
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 29. Messages (SMS, RCS, WhatsApp message logs)
+// ---------------------------------------------------------------------------
+export const messages = sqliteTable(
+  "messages",
+  {
+    id: text("id").primaryKey(), // e.g. "msg_01JB..."
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    environment: text("environment", { enum: ["test", "live"] }).notNull().default("test"),
+    channel: text("channel", { enum: ["sms", "rcs", "whatsapp"] }).notNull(),
+    to: text("to").notNull(), // e.g. "+919876543210"
+    recipient: text("recipient"), // synonym for compatibility
+    senderId: text("sender_id").notNull().default("RELAYI"),
+    templateId: text("template_id"),
+    body: text("body").notNull(),
+    status: text("status", {
+      enum: ["queued", "sent", "delivered", "failed", "read"],
+    }).notNull().default("delivered"),
+    failureReason: text("failure_reason"),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+    deliveredAt: integer("delivered_at", { mode: "timestamp" }),
+    externalRef: text("external_ref"),
+    costWouldBe: real("cost_would_be").notNull().default(0),
+    cost: real("cost").notNull().default(0),
+  },
+  (table) => ({
+    wsMsgIdx: index("msg_ws_idx").on(table.workspaceId),
+    envMsgIdx: index("msg_env_idx").on(table.environment),
+    statusMsgIdx: index("msg_status_idx").on(table.status),
+    channelMsgIdx: index("msg_channel_idx").on(table.channel),
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 30. Customers Profiles (Customer Data Platform / CDP)
+// ---------------------------------------------------------------------------
+export const customersProfiles = sqliteTable(
+  "customers_profiles",
+  {
+    id: text("id").primaryKey(), // e.g. "prf_..."
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    environment: text("environment", { enum: ["test", "live"] }).notNull().default("test"),
+    externalId: text("external_id").notNull(), // Customer's CRM/App user id
+    attributes: text("attributes").notNull().default("{}"), // JSON string
+    traits: text("traits").notNull().default("{}"), // JSON string
+    eventsCount: integer("events_count").notNull().default(0),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+  },
+  (table) => ({
+    wsProfileIdx: index("cp_ws_idx").on(table.workspaceId),
+    externalIdIdx: index("cp_external_idx").on(table.workspaceId, table.externalId),
+  })
+);
+
+// Alias for customerProfiles
+export const customerProfiles = customersProfiles;
+
+// ---------------------------------------------------------------------------
+// 31. Events Ingested (CDP Event streams linked to customer profiles)
+// ---------------------------------------------------------------------------
+export const eventsIngested = sqliteTable(
+  "events_ingested",
+  {
+    id: text("id").primaryKey(), // e.g. "evt_..."
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    environment: text("environment", { enum: ["test", "live"] }).notNull().default("test"),
+    customerId: text("customer_id").references(() => customersProfiles.id, { onDelete: "set null" }),
+    eventName: text("event_name").notNull(), // e.g. "order_placed", "cart_abandoned"
+    properties: text("properties").notNull().default("{}"), // JSON
+    timestamp: integer("timestamp", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+  },
+  (table) => ({
+    wsEventIdx: index("ei_ws_idx").on(table.workspaceId),
+    nameIdx: index("ei_name_idx").on(table.eventName),
+    custIdx: index("ei_cust_idx").on(table.customerId),
+  })
+);
+
+// Alias for eventsLog
+export const eventsLog = eventsIngested;
+
+// ---------------------------------------------------------------------------
+// 32. Changelog Entries (API versions, changes, deprecations & sunset dates)
+// ---------------------------------------------------------------------------
+export const changelogEntries = sqliteTable(
+  "changelog_entries",
+  {
+    id: text("id").primaryKey(),
+    version: text("version").notNull(), // "v2025-10-01", "v2025-01-15", "v2024-06-01"
+    date: text("date").notNull(), // "2026-10-30"
+    type: text("type", {
+      enum: ["added", "changed", "deprecated", "removed", "fixed", "security"],
+    }).notNull(),
+    title: text("title").notNull(),
+    body: text("body").notNull(),
+    affectedEndpoints: text("affected_endpoints").notNull().default("[]"), // JSON array
+    breaking: integer("breaking", { mode: "boolean" }).notNull().default(false),
+    sunsetDate: text("sunset_date"),
+  },
+  (table) => ({
+    versionIdx: index("cle_version_idx").on(table.version),
+    typeIdx: index("cle_type_idx").on(table.type),
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 33. API Versions
+// ---------------------------------------------------------------------------
+export const apiVersions = sqliteTable("api_versions", {
+  id: text("id").primaryKey(), // "v2025-10-01", "v2025-01-15", "v2024-06-01"
+  label: text("label").notNull(),
+  status: text("status", {
+    enum: ["current", "supported", "deprecated", "sunset"],
+  }).notNull().default("supported"),
+  releasedAt: text("released_at").notNull(),
+  sunsetAt: text("sunset_at"),
+});
+
+// ---------------------------------------------------------------------------
+// 34. Support Threads
+// ---------------------------------------------------------------------------
+export const supportThreads = sqliteTable(
+  "support_threads",
+  {
+    id: text("id").primaryKey(), // "thr_..."
+    workspaceId: text("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    subject: text("subject").notNull(),
+    status: text("status", { enum: ["open", "waiting", "resolved"] }).notNull().default("open"),
+    context: text("context").notNull().default("{}"), // JSON
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+    messages: text("messages").notNull().default("[]"), // JSON array of message objects
+  },
+  (table) => ({
+    wsThreadIdx: index("st_ws_idx").on(table.workspaceId),
+    statusThreadIdx: index("st_status_idx").on(table.status),
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 35. Doc Chunks (For docs search & AI integration)
+// ---------------------------------------------------------------------------
+export const docChunks = sqliteTable(
+  "doc_chunks",
+  {
+    id: text("id").primaryKey(),
+    slug: text("slug").notNull(),
+    title: text("title").notNull(),
+    section: text("section").notNull(),
+    content: text("content").notNull(),
+    version: text("version").notNull().default("v2025-10-01"),
+  },
+  (table) => ({
+    slugIdx: index("dc_slug_idx").on(table.slug),
+    sectionIdx: index("dc_section_idx").on(table.section),
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 36. Doc Feedback (Was this helpful? with optional comments)
+// ---------------------------------------------------------------------------
+export const docFeedback = sqliteTable(
+  "doc_feedback",
+  {
+    id: text("id").primaryKey(),
+    pagePath: text("page_path").notNull(),
+    helpful: integer("helpful", { mode: "boolean" }).notNull(),
+    comment: text("comment"),
+    version: text("version").notNull().default("v2025-10-01"),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+  },
+  (table) => ({
+    pageIdx: index("df_page_idx").on(table.pagePath),
+  })
+);
+
+// ---------------------------------------------------------------------------
+// 37. Changelog Subscriptions (Email me about breaking changes)
+// ---------------------------------------------------------------------------
+export const changelogSubscriptions = sqliteTable("changelog_subscriptions", {
+  id: text("id").primaryKey(),
+  email: text("email").notNull().unique(),
+  subscribedBreakingChanges: integer("subscribed_breaking_changes", { mode: "boolean" }).notNull().default(true),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+});
+
+// ---------------------------------------------------------------------------
+// 40. Solutions Inquiries (Enterprise & Evaluator contacts)
+// ---------------------------------------------------------------------------
+export const solutionsInquiries = sqliteTable("solutions_inquiries", {
+  id: text("id").primaryKey(), // "inq_..."
+  name: text("name").notNull(),
+  email: text("email").notNull(),
+  company: text("company").notNull(),
+  monthlyVolume: text("monthly_volume").notNull(), // "< 100k", "100k - 1M", "1M - 10M", "10M+"
+  channels: text("channels"), // JSON array e.g. ["sms", "whatsapp"]
+  useCase: text("use_case"),
+  status: text("status", { enum: ["new", "contacted", "qualified"] }).notNull().default("new"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+});
+
+// ---------------------------------------------------------------------------
+// 41. Usage Alert Preferences (Threshold & notification settings)
+// ---------------------------------------------------------------------------
+export const usageAlertPreferences = sqliteTable("usage_alert_preferences", {
+  workspaceId: text("workspace_id").primaryKey().references(() => workspaces.id, { onDelete: "cascade" }),
+  threshold80: integer("threshold_80", { mode: "boolean" }).notNull().default(true),
+  threshold95: integer("threshold_95", { mode: "boolean" }).notNull().default(true),
+  spike429: integer("spike_429", { mode: "boolean" }).notNull().default(true),
+  lowBalanceThreshold: real("low_balance_threshold").notNull().default(500),
+  emailNotifications: integer("email_notifications", { mode: "boolean" }).notNull().default(true),
+  notificationEmail: text("notification_email"),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+});
+
+// ---------------------------------------------------------------------------
+// 42. Limit Elevation Requests
+// ---------------------------------------------------------------------------
+export const limitRequests = sqliteTable("limit_requests", {
+  id: text("id").primaryKey(), // "lrq_..."
+  workspaceId: text("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  currentTier: text("current_tier").notNull(),
+  requestedTps: integer("requested_tps").notNull(),
+  reason: text("reason").notNull(),
+  channels: text("channels"), // JSON array
+  status: text("status", { enum: ["pending", "approved", "rejected"] }).notNull().default("pending"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+});
+
+// ---------------------------------------------------------------------------
+// 43. System Incidents (For system status page /status)
+// ---------------------------------------------------------------------------
+export const incidents = sqliteTable("incidents", {
+  id: text("id").primaryKey(), // "inc_..."
+  title: text("title").notNull(),
+  status: text("status", { enum: ["investigating", "identified", "monitoring", "resolved"] }).notNull().default("resolved"),
+  impact: text("impact", { enum: ["none", "minor", "major", "critical"] }).notNull().default("none"),
+  affectedComponents: text("affected_components").notNull().default("[]"), // JSON string array
+  updates: text("updates").notNull().default("[]"), // JSON array of updates
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+  resolvedAt: integer("resolved_at", { mode: "timestamp" }),
+});
+
+// ---------------------------------------------------------------------------
+// 44. Known Issues
+// ---------------------------------------------------------------------------
+export const knownIssues = sqliteTable("known_issues", {
+  id: text("id").primaryKey(), // "iss_..."
+  title: text("title").notNull(),
+  component: text("component").notNull(),
+  status: text("status", { enum: ["investigating", "workaround_available", "fix_in_progress", "resolved"] }).notNull().default("workaround_available"),
+  description: text("description").notNull(),
+  workaround: text("workaround"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().default(sql`(strftime('%s', 'now'))`),
+});
+
 // Types
 export type InternalUser = typeof internalUsers.$inferSelect;
 export type Plan = typeof plans.$inferSelect;
@@ -555,3 +1072,25 @@ export type AiRun = typeof aiRuns.$inferSelect;
 export type Task = typeof tasks.$inferSelect;
 export type ApprovalPolicy = typeof approvalPolicies.$inferSelect;
 export type Alert = typeof alerts.$inferSelect;
+
+export type User = typeof users.$inferSelect;
+export type Session = typeof sessions.$inferSelect;
+export type ApiKey = typeof apiKeys.$inferSelect;
+export type Message = typeof messages.$inferSelect;
+export type CustomerProfile = typeof customersProfiles.$inferSelect;
+export type EventIngested = typeof eventsIngested.$inferSelect;
+export type WebhookEndpoint = typeof webhookEndpoints.$inferSelect;
+export type WebhookEvent = typeof webhookEvents.$inferSelect;
+export type WebhookDelivery = typeof webhookDeliveries.$inferSelect;
+export type ApiRequest = typeof apiRequests.$inferSelect;
+export type ChangelogEntry = typeof changelogEntries.$inferSelect;
+export type ApiVersion = typeof apiVersions.$inferSelect;
+export type SupportThread = typeof supportThreads.$inferSelect;
+export type DocChunk = typeof docChunks.$inferSelect;
+export type DocFeedback = typeof docFeedback.$inferSelect;
+export type ChangelogSubscription = typeof changelogSubscriptions.$inferSelect;
+export type SolutionsInquiry = typeof solutionsInquiries.$inferSelect;
+export type UsageAlertPreferences = typeof usageAlertPreferences.$inferSelect;
+export type LimitRequest = typeof limitRequests.$inferSelect;
+export type Incident = typeof incidents.$inferSelect;
+export type KnownIssue = typeof knownIssues.$inferSelect;

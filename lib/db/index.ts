@@ -16,12 +16,10 @@ if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
     if (!fs.existsSync(tmpDbPath) && fs.existsSync(dbPath)) {
       fs.copyFileSync(dbPath, tmpDbPath);
     }
-    if (fs.existsSync(tmpDbPath)) {
-      dbPath = tmpDbPath;
-    }
   } catch (err) {
     console.warn("Could not copy database to /tmp:", err);
   }
+  dbPath = tmpDbPath;
 }
 
 // Singleton client for hot reload in Next.js development

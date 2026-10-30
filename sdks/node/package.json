@@ -1,0 +1,13 @@
+{
+  "name": "@relay/node",
+  "version": "1.0.0",
+  "description": "Official TypeScript/Node.js SDK for Relay Telecom & CDP APIs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": ["relay", "sms", "rcs", "whatsapp", "cdp", "telecom"],
+  "author": "Relay Telecom Technologies",
+  "license": "MIT"
+}

@@ -6,7 +6,7 @@ import { aiRuns } from "@/lib/db/schema";
 import { eq, desc } from "drizzle-orm";
 
 const apiKey = process.env.GEMINI_API_KEY?.trim() || "";
-export let activeGeminiModel = process.env.GEMINI_MODEL || "gemini-flash-latest";
+export let activeGeminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 export const geminiModel = activeGeminiModel;
 
 export const ai = apiKey && apiKey.length > 5 ? new GoogleGenAI({ apiKey }) : null;
@@ -19,7 +19,10 @@ export type AIFeature =
   | "health_summary"
   | "churn_prediction"
   | "credit_forecast"
-  | "kyc_extraction";
+  | "kyc_extraction"
+  | "ask_docs"
+  | "generate_code"
+  | "explain_webhook";
 
 export interface AIExecutionResult<T> {
   success: boolean;
@@ -37,6 +40,7 @@ export interface AIExecutionResult<T> {
 export interface GenerateStructuredParams<T> {
   feature: AIFeature;
   userId?: string;
+  workspaceId?: string;
   systemPrompt?: string;
   prompt: string;
   schema: z.ZodType<T, any, any>;
@@ -195,19 +199,20 @@ export async function executeStructuredAI<T>(
     const outputJson = JSON.stringify(fallbackData);
 
     try {
-      db.insert(aiRuns)
-        .values({
-          id: runId,
-          feature: params.feature,
-          userId: actingUserId,
-          inputHash,
-          output: outputJson,
-          model: "rule_based_fallback",
-          latencyMs,
-          status: "fallback",
-          accepted: null,
-          createdAt: new Date(),
-        })
+        db.insert(aiRuns)
+          .values({
+            id: runId,
+            feature: params.feature,
+            userId: actingUserId,
+            workspaceId: params.workspaceId || null,
+            inputHash,
+            output: outputJson,
+            model: "rule_based_fallback",
+            latencyMs,
+            status: "fallback",
+            accepted: null,
+            createdAt: new Date(),
+          })
         .run();
     } catch (dbErr) {
       console.error("Failed to log fallback AI run to DB:", dbErr);
@@ -259,14 +264,15 @@ export async function executeStructuredAI<T>(
     const outputJson = JSON.stringify(validatedData);
 
     try {
-      db.insert(aiRuns)
-        .values({
-          id: runId,
-          feature: params.feature,
-          userId: actingUserId,
-          inputHash,
-          output: outputJson,
-          model: modelUsed,
+        db.insert(aiRuns)
+          .values({
+            id: runId,
+            feature: params.feature,
+            userId: actingUserId,
+            workspaceId: params.workspaceId || null,
+            inputHash,
+            output: outputJson,
+            model: modelUsed,
           latencyMs,
           status: "success",
           accepted: null,
@@ -295,19 +301,20 @@ export async function executeStructuredAI<T>(
     const outputJson = JSON.stringify(fallbackData);
 
     try {
-      db.insert(aiRuns)
-        .values({
-          id: runId,
-          feature: params.feature,
-          userId: actingUserId,
-          inputHash,
-          output: outputJson,
-          model: "rule_based_fallback",
-          latencyMs,
-          status: "fallback",
-          accepted: null,
-          createdAt: new Date(),
-        })
+        db.insert(aiRuns)
+          .values({
+            id: runId,
+            feature: params.feature,
+            userId: actingUserId,
+            workspaceId: params.workspaceId || null,
+            inputHash,
+            output: outputJson,
+            model: "rule_based_fallback",
+            latencyMs,
+            status: "fallback",
+            accepted: null,
+            createdAt: new Date(),
+          })
         .run();
     } catch (dbErr) {
       console.error("Failed to log fallback AI run to DB:", dbErr);

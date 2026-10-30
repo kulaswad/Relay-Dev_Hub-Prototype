@@ -1,0 +1,11 @@
+{
+  "name": "sample-otp-sender-node",
+  "version": "1.0.0",
+  "description": "Runnable sample app demonstrating transactional OTP sending with Relay",
+  "scripts": {
+    "start": "tsx index.ts"
+  },
+  "dependencies": {
+    "tsx": "^4.7.0"
+  }
+}
